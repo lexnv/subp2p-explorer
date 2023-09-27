@@ -1,0 +1,38 @@
+[package]
+name = "subp2p-explorer-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+description = "Command line utilities for working with subp2p-explorer"
+
+[[bin]]
+name = "subp2p-explorer-cli"
+path = "src/main.rs"
+
+[dependencies]
+subp2p-explorer = { workspace = true }
+tokio = { workspace = true, features = ["macros", "time", "rt-multi-thread"] }
+async-trait = { workspace = true }
+env_logger = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+libp2p = { workspace = true, features = ["dns", "identify", "kad", "macros", "mdns", "noise", "ping", "tcp",  "tokio", "yamux", "websocket", "request-response"] }
+rand = { workspace = true }
+fnv = { workspace = true }
+log = { workspace = true }
+either = { workspace = true }
+void = { workspace = true }
+pin-project = { workspace = true }
+asynchronous-codec = { workspace = true }
+unsigned-varint = { workspace = true, features = ["futures", "asynchronous_codec"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+codec = { package = "parity-scale-codec", workspace = true, features = ["derive"] }
+primitive-types = { workspace = true, default-features = false, features = ["codec", "scale-info", "serde"] }
+hex = { workspace = true }
+clap = { workspace = true }
