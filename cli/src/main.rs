@@ -48,23 +48,16 @@ pub struct SendExtrinisicOpts {
     extrinsics: String,
 }
 
-async fn submit_extrinsics(
+fn build_swarm(
     genesis: String,
     bootnodes: Vec<String>,
-    extrinsics: String,
-) -> Result<(), Box<dyn Error>> {
-    if bootnodes.is_empty() {
-        panic!("Expected at least one bootnode");
-    }
-
+) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
     // Create a random key for ourselves.
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
     tracing::info!("Local peer ID {:?}", local_peer_id);
 
     let genesis = genesis.trim_start_matches("0x");
-
-    let payload = hex::decode(extrinsics.trim_start_matches("0x"))?;
 
     // Parse the provided bootnodes as `PeerId` and `MultiAddress`.
     let bootnodes: Vec<_> = bootnodes
@@ -119,7 +112,19 @@ async fn submit_extrinsics(
             .add_address(peer, multiaddress.clone());
     }
 
+    Ok(swarm)
+}
+
+async fn submit_extrinsics(
+    genesis: String,
+    bootnodes: Vec<String>,
+    extrinsics: String,
+) -> Result<(), Box<dyn Error>> {
+    let mut swarm = build_swarm(genesis, bootnodes)?;
+    let payload = hex::decode(extrinsics.trim_start_matches("0x"))?;
+
     // Perform the kademlia bootstrap.
+    let local_peer_id = swarm.local_peer_id().clone();
     let _query_id = swarm
         .behaviour_mut()
         .discovery
