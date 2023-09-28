@@ -272,6 +272,8 @@ impl NetworkDiscovery {
         // Start by performing 128 queries.
         self.insert_queries(128);
 
+        let mut old_log_time = std::time::Instant::now();
+
         loop {
             let event = self.swarm.select_next_some().await;
 
@@ -294,8 +296,15 @@ impl NetworkDiscovery {
                             Ok(GetClosestPeersOk { peers, .. }) => peers,
                             Err(GetClosestPeersError::Timeout { peers, .. }) => peers,
                         };
+                        let num_discovered = peers.len();
 
                         self.discovered.extend(peers);
+
+                        let now = std::time::Instant::now();
+                        if now.duration_since(old_log_time) > Duration::from_secs(10) {
+                            old_log_time = now;
+                            log::info!("...Discovery in progress last_query_num={num_discovered} total_peers={}", self.discovered.len());
+                        }
 
                         if self.queries.is_empty() {
                             self.insert_queries(128);
