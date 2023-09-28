@@ -2,6 +2,17 @@
 // This file is dual-licensed as Apache-2.0 or GPL-3.0.
 // see LICENSE for license details.
 
+use crate::notifications::{
+    behavior::ProtocolsData,
+    messages::BlockAnnouncesHandshake,
+    upgrades::{
+        combine_upgrades::CombineUpgrades,
+        handshake::{
+            HandshakeInbound, HandshakeInboundSubstream, HandshakeOutbound,
+            HandshakeOutboundSubstream,
+        },
+    },
+};
 use bytes::BytesMut;
 use codec::Encode;
 use futures::{channel::mpsc, prelude::*, SinkExt};
@@ -14,7 +25,6 @@ use libp2p::{
     },
     PeerId,
 };
-
 use std::{
     collections::VecDeque,
     mem,
@@ -22,17 +32,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::notifications::{
-    behavior::ProtocolsData,
-    messages::BlockAnnouncesHandshake,
-    upgrades::{
-        combine_upgrades::CombineUpgrades,
-        handshake::{
-            HandshakeInbound, HandshakeInboundSubstream, HandshakeOutbound,
-            HandshakeOutboundSubstream,
-        },
-    },
-};
+const LOG_TARGET: &str = "subp2p-handler";
 
 /// Configuration for a notifications protocol.
 pub struct ProtocolDetails {
@@ -243,7 +243,7 @@ impl ConnectionHandler for NotificationsHandler {
             }) => {
                 let (mut stream, index) = (protocol.data, protocol.index);
 
-                log::info!(
+                log::info!(target: LOG_TARGET,
                     "Handler negotiated inbound peer={:?} index={:?}",
                     self.peer,
                     index
@@ -253,6 +253,7 @@ impl ConnectionHandler for NotificationsHandler {
                 match proto.state {
                     State::Closed { pending_opening } => {
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler negotiated inbound Closed -> OpenDesiredByRemote peer={:?} index={:?}",
                             self.peer,
                             index
@@ -270,6 +271,7 @@ impl ConnectionHandler for NotificationsHandler {
                     }
                     State::OpenDesiredByRemote { .. } => {
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler negotiated inbound OpenDesiredByRemote peer={:?} index={:?}",
                             self.peer,
                             index
@@ -286,6 +288,7 @@ impl ConnectionHandler for NotificationsHandler {
                         // Already handled.
                         if inbound_substream.is_some() {
                             log::debug!(
+                                target: LOG_TARGET,
                                 "Handler negotiated inbound handshake already handled peer={:?} index={:?}",
                                 self.peer,
                                 index
@@ -294,6 +297,7 @@ impl ConnectionHandler for NotificationsHandler {
                         }
 
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler negotiated inbound setup handshake peer={:?} index={:?}",
                             self.peer,
                             index
@@ -309,6 +313,7 @@ impl ConnectionHandler for NotificationsHandler {
                 let (opened, index) = (outbound.protocol, outbound.info);
 
                 log::info!(
+                    target: LOG_TARGET,
                     "Handler negotiated outbound peer={:?} index={:?}",
                     self.peer,
                     index
@@ -324,6 +329,7 @@ impl ConnectionHandler for NotificationsHandler {
                         ..
                     } => {
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler negotiated outbound Closed|OpenDesiredByRemote peer={:?} index={:?}",
                             self.peer,
                             index
@@ -336,6 +342,7 @@ impl ConnectionHandler for NotificationsHandler {
                         inbound,
                     } => {
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler negotiated outbound Opening successful peer={:?} index={:?}",
                             self.peer,
                             index
@@ -361,6 +368,7 @@ impl ConnectionHandler for NotificationsHandler {
                     }
                     State::Open { .. } => {
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler negotiated outbound Open missmatch-state peer={:?} index={:?}",
                             self.peer,
                             index
@@ -370,6 +378,7 @@ impl ConnectionHandler for NotificationsHandler {
             }
             ConnectionEvent::DialUpgradeError(err) => {
                 log::error!(
+                    target: LOG_TARGET,
                     "Handler DialError peer={:?} index={:?} error={:?}",
                     self.peer,
                     err.info,
@@ -387,6 +396,7 @@ impl ConnectionHandler for NotificationsHandler {
                         ..
                     } => {
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler DialError Closed|OpenDesiredByRemote peer={:?} info={:?}",
                             self.peer,
                             err.info,
@@ -400,6 +410,7 @@ impl ConnectionHandler for NotificationsHandler {
                         };
 
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler DialError Opening -> Closed peer={:?} info={:?}",
                             self.peer,
                             err.info,
@@ -421,6 +432,7 @@ impl ConnectionHandler for NotificationsHandler {
         match message {
             NotificationsHandlerFromBehavior::Open { index } => {
                 log::info!(
+                    target: LOG_TARGET,
                     "Handler from behavior Open peer={:?} index={:?}",
                     self.peer,
                     index
@@ -437,6 +449,7 @@ impl ConnectionHandler for NotificationsHandler {
                             };
 
                             log::debug!(
+                                target: LOG_TARGET,
                                 "Handler from behavior Closed -> request new substream peer={:?} index={:?}",
                                 self.peer,
                                 index
@@ -450,6 +463,7 @@ impl ConnectionHandler for NotificationsHandler {
                         }
 
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler from behavior Closed -> Opening peer={:?} index={:?}",
                             self.peer,
                             index
@@ -471,6 +485,7 @@ impl ConnectionHandler for NotificationsHandler {
                             };
 
                             log::debug!(
+                                target: LOG_TARGET,
                                 "Handler from behavior OpenDesiredByRemote -> request new substream peer={:?} index={:?}",
                                 self.peer,
                                 index
@@ -484,6 +499,7 @@ impl ConnectionHandler for NotificationsHandler {
                         }
 
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler from behavior OpenDesiredByRemote setup handshake peer={:?} index={:?}",
                             self.peer,
                             index
@@ -511,6 +527,7 @@ impl ConnectionHandler for NotificationsHandler {
                     }
                     State::Opening { .. } | State::Open { .. } => {
                         log::error!(
+                            target: LOG_TARGET,
                             "Handler from behavior Opening|Open statemissmatch peer={:?} index={:?}",
                             self.peer,
                             index
@@ -521,6 +538,7 @@ impl ConnectionHandler for NotificationsHandler {
 
             NotificationsHandlerFromBehavior::Close { index } => {
                 log::info!(
+                    target: LOG_TARGET,
                     "Handler from behavior Close peer={:?} index={:?}",
                     self.peer,
                     index
@@ -541,6 +559,7 @@ impl ConnectionHandler for NotificationsHandler {
                         };
 
                         log::debug!(
+                            target: LOG_TARGET,
                             "Handler from behavior Close with handshake in progress peer={:?} index={:?}",
                             self.peer,
                             index
@@ -627,6 +646,7 @@ impl ConnectionHandler for NotificationsHandler {
                     };
 
                     log::debug!(
+                        target: LOG_TARGET,
                         "Handler poll send message peer={:?} index={:?} message={:?}",
                         self.peer,
                         index,

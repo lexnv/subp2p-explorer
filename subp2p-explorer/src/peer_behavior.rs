@@ -29,9 +29,10 @@ use libp2p::{
 };
 
 /// The agent client string of this crate.
-pub const AGENT: &str = "subxt-p2p-agent";
+const AGENT: &str = "subp2p-agent";
+const LOG_TARGET: &str = "subp2p-peer-behavior";
 
-/// Acurate p2p behavior as part of the substrate network.
+/// Accurate p2p behavior as part of the substrate network.
 ///
 /// Implements ping and identity as protocols under "/ipfs/ping/1.0.0" and "/substrate/1.0" (equivalent of "/ipfs/id/1.0.0").
 ///
@@ -349,7 +350,7 @@ impl NetworkBehaviour for PeerBehaviour {
             match self.ping.poll(cx, params) {
                 Poll::Pending => break,
                 Poll::Ready(ToSwarm::GenerateEvent(ev)) => {
-                    log::debug!(
+                    log::debug!(target: LOG_TARGET,
                         "PingEvent peer_id={:?} connection_id={:?} result {:?}",
                         ev.peer,
                         ev.connection,
@@ -414,7 +415,7 @@ impl NetworkBehaviour for PeerBehaviour {
                         return Poll::Ready(ToSwarm::GenerateEvent(event));
                     }
                     IdentifyEvent::Error { peer_id, error } => {
-                        log::debug!("Identification with peer={:?} error={}", peer_id, error)
+                        log::debug!(target: LOG_TARGET, "Identification with peer={:?} error={}", peer_id, error)
                     }
                     IdentifyEvent::Pushed { .. } => {}
                     IdentifyEvent::Sent { .. } => {}

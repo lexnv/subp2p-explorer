@@ -27,8 +27,9 @@ use asynchronous_codec::Framed;
 use bytes::BytesMut;
 use futures::prelude::*;
 use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use log::{error, warn};
 use unsigned_varint::codec::UviBytes;
+
+const LOG_TARGET: &str = "subp2p-upgrades";
 
 use std::{
     convert::Infallible,
@@ -121,6 +122,7 @@ where
 
     fn upgrade_inbound(self, mut socket: TSubstream, negotiated_name: Self::Info) -> Self::Future {
         log::info!(
+            target: LOG_TARGET,
             "HandshakeInbound name={:?} current_name={:?}",
             negotiated_name,
             self.name
@@ -129,6 +131,7 @@ where
         Box::pin(async move {
             let handshake_len = unsigned_varint::aio::read_usize(&mut socket).await?;
             log::debug!(
+                target: LOG_TARGET,
                 "HandshakeInbound length={:?} name={:?}",
                 handshake_len,
                 negotiated_name
@@ -149,6 +152,7 @@ where
             }
 
             log::debug!(
+                target: LOG_TARGET,
                 "HandshakeInbound received handshake={:?} name={:?}",
                 handshake,
                 negotiated_name
@@ -210,7 +214,7 @@ where
                 HandshakeInboundSubstreamState::Sending(handshake) => {
                     match Sink::poll_ready(this.socket.as_mut(), cx) {
                         Poll::Ready(_) => {
-                            log::debug!("HandshakeInboundSubstream: poll_process: Sink is ready start sendind name={:?}", this.negotiated_name);
+                            log::debug!(target: LOG_TARGET, "HandshakeInboundSubstream: poll_process: Sink is ready start sendind name={:?}", this.negotiated_name);
 
                             *this.state = HandshakeInboundSubstreamState::Flush;
 
@@ -218,7 +222,7 @@ where
                             {
                                 Ok(()) => {}
                                 Err(err) => {
-                                    log::error!("HandshakeInboundSubstream: poll_process: Failed to start seding name={:?} error={:?}", this.negotiated_name, err);
+                                    log::error!(target: LOG_TARGET, "HandshakeInboundSubstream: poll_process: Failed to start seding name={:?} error={:?}", this.negotiated_name, err);
 
                                     return Poll::Ready(Err(err));
                                 }
@@ -233,6 +237,7 @@ where
 
                 HandshakeInboundSubstreamState::Flush => {
                     log::debug!(
+                        target: LOG_TARGET,
                         "HandshakeInboundSubstream: poll_process: poll_flush name={:?}",
                         this.negotiated_name
                     );
@@ -268,6 +273,7 @@ where
             let state = mem::replace(this.state, HandshakeInboundSubstreamState::Done);
 
             log::debug!(
+                target: LOG_TARGET,
                 "HandshakeInboundSubstream: poll_next: state={:?} name={:?}",
                 state,
                 this.negotiated_name
@@ -288,6 +294,7 @@ where
                                 Ok(()) => (),
                                 Err(err) => {
                                     log::trace!(
+                                        target: LOG_TARGET,
                                         "HandshakeInboundSubstream: Cannot send handshake name={:?}",
                                         this.negotiated_name
                                     );
@@ -315,9 +322,10 @@ where
                     match Stream::poll_next(this.socket.as_mut(), cx) {
                         Poll::Ready(None) => {
                             log::debug!(
-								"HandshakeInboundSubstream: poll_next: Closing in response to peer name={:?}",
+                                target: LOG_TARGET,
+                                "HandshakeInboundSubstream: poll_next: Closing in response to peer name={:?}",
                                 this.negotiated_name
-							);
+                            );
                             *this.state = HandshakeInboundSubstreamState::NeedsClose
                         }
                         Poll::Ready(Some(result)) => {
@@ -334,6 +342,7 @@ where
                     match Sink::poll_close(this.socket.as_mut(), cx)? {
                         Poll::Ready(()) => {
                             log::debug!(
+                                target: LOG_TARGET,
                                 "HandshakeInboundSubstream: poll_close: fully clsoed name={:?}",
                                 this.negotiated_name
                             );
@@ -380,6 +389,7 @@ where
 
     fn upgrade_outbound(self, mut socket: TSubstream, negotiated_name: Self::Info) -> Self::Future {
         log::info!(
+            target: LOG_TARGET,
             "HandshakeOutbound name={:?} current_name={:?}",
             negotiated_name,
             self.name
@@ -387,6 +397,7 @@ where
 
         Box::pin(async move {
             log::debug!(
+                target: LOG_TARGET,
                 "HandshakeOutbound prepare to write handshake={:?} name={:?}",
                 self.handshake,
                 negotiated_name
@@ -395,6 +406,7 @@ where
             upgrade::write_length_prefixed(&mut socket, &self.handshake).await?;
 
             log::debug!(
+                target: LOG_TARGET,
                 "HandshakeOutbound prepare to read handshake length name={:?}",
                 negotiated_name
             );
@@ -402,6 +414,7 @@ where
             let handshake_len = unsigned_varint::aio::read_usize(&mut socket).await?;
 
             log::debug!(
+                target: LOG_TARGET,
                 "HandshakeOutbound handshake len={:?} name={:?}",
                 handshake_len,
                 negotiated_name
@@ -492,7 +505,7 @@ impl From<unsigned_varint::io::ReadError> for HandshakeError {
             unsigned_varint::io::ReadError::Io(err) => Self::Io(err),
             unsigned_varint::io::ReadError::Decode(err) => Self::VarintDecode(err),
             _ => {
-                warn!("Unrecognized varint decoding error");
+                log::warn!(target: LOG_TARGET, "Unrecognized varint decoding error");
                 Self::Io(From::from(io::ErrorKind::InvalidData))
             }
         }
