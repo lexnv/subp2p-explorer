@@ -151,7 +151,7 @@ async fn submit_extrinsics(
     let payload = hex::decode(extrinsics.trim_start_matches("0x"))?;
 
     // Perform the kademlia bootstrap.
-    let local_peer_id = swarm.local_peer_id().clone();
+    let local_peer_id = *swarm.local_peer_id();
     let _query_id = swarm
         .behaviour_mut()
         .discovery
@@ -384,7 +384,7 @@ impl Locator {
     }
 
     pub fn locate(&self, ip: IpAddr) -> Option<String> {
-        let City { city, .. } = self.db.lookup(ip.into()).ok()?;
+        let City { city, .. } = self.db.lookup(ip).ok()?;
 
         let city = city
             .as_ref()?
@@ -421,8 +421,7 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
         .filter(|(_peer, info)| {
             info.protocols
                 .iter()
-                .find(|stream_proto| stream_proto.as_ref().contains(&genesis))
-                .is_some()
+                .any(|stream_proto| stream_proto.as_ref().contains(&genesis))
         })
         .collect();
 
@@ -434,12 +433,7 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
 
     let peers_with_public_addr: HashMap<_, _> = infos
         .iter()
-        .filter(|(_peer, info)| {
-            info.listen_addrs
-                .iter()
-                .find(|addr| is_public_address(addr))
-                .is_some()
-        })
+        .filter(|(_peer, info)| info.listen_addrs.iter().any(is_public_address))
         .collect();
     println!(
         "  Peers with public addresses {:?}",
@@ -486,8 +480,8 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
     // Print top 10 cities.
     let mut cities: Vec<_> = cities.iter().collect();
     cities.sort_by_key(|data| Reverse(*data.1));
-    let mut iter = cities.iter().take(10);
-    while let Some((city, count)) = iter.next() {
+    let iter = cities.iter().take(10);
+    for (city, count) in iter {
         println!("   City={:?} peers={:?}", city, count);
     }
 
