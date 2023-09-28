@@ -2,6 +2,7 @@
 // This file is dual-licensed as Apache-2.0 or GPL-3.0.
 // see LICENSE for license details.
 
+use ip_network::IpNetwork;
 use subp2p_explorer::{
     discovery::DiscoveryBuilder,
     notifications::{
@@ -19,13 +20,22 @@ use libp2p::{
     identify::Info,
     identity,
     kad::{GetClosestPeersError, GetClosestPeersOk, KademliaEvent, QueryId, QueryResult},
+    multiaddr::Protocol,
     swarm::{SwarmBuilder, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
+use maxminddb::{geoip2::City, Reader as GeoIpReader};
 use primitive_types::H256;
-use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::error::Error;
 use std::time::Duration;
+use std::{cmp::Reverse, error::Error};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    net::IpAddr,
+};
+use trust_dns_resolver::{
+    config::{ResolverConfig, ResolverOpts},
+    Resolver,
+};
 
 /// Command for interacting with the CLI.
 #[derive(Debug, ClapParser)]
@@ -349,17 +359,58 @@ impl NetworkDiscovery {
     }
 }
 
+fn is_public_address(addr: &Multiaddr) -> bool {
+    let ip = match addr.iter().next() {
+        Some(Protocol::Ip4(ip)) => IpNetwork::from(ip),
+        Some(Protocol::Ip6(ip)) => IpNetwork::from(ip),
+        Some(Protocol::Dns(_)) | Some(Protocol::Dns4(_)) | Some(Protocol::Dns6(_)) => return true,
+        _ => return false,
+    };
+    ip.is_global()
+}
+
+/// Translate IP addresses to city locations.
+struct Locator {
+    db: maxminddb::Reader<&'static [u8]>,
+}
+
+impl Locator {
+    /// Taken from here: https://github.com/P3TERX/GeoLite.mmdb/releases/tag/2022.06.07
+    const CITY_DATA: &'static [u8] = include_bytes!("../../artifacts/GeoLite2-City.mmdb");
+
+    pub fn new() -> Self {
+        Self {
+            db: GeoIpReader::from_source(Self::CITY_DATA).expect("City data is always valid"),
+        }
+    }
+
+    pub fn locate(&self, ip: IpAddr) -> Option<String> {
+        let City { city, .. } = self.db.lookup(ip.into()).ok()?;
+
+        let city = city
+            .as_ref()?
+            .names
+            .as_ref()?
+            .get("en")?
+            .to_string()
+            .into_boxed_str();
+
+        Some(city.into_string())
+    }
+}
+
 async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(), Box<dyn Error>> {
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
 
-    // Drive network events for 3 minutes.
+    // Drive network events for a few minutes.
     let _ = tokio::time::timeout(
         Duration::from_secs(3 * 60),
         network_discovery.drive_events(),
     )
     .await;
 
+    println!("Dialed num={} peers", network_discovery.dialed_peers.len());
     println!(
         "Discovered num={} peers",
         network_discovery.discovered_with_addresses.len()
@@ -382,7 +433,61 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
     );
     println!("Peers that support our genesis hash {:?}", infos.len());
 
-    println!("Dialed num={} peers", network_discovery.dialed_peers.len());
+    let peers_with_public_addr: HashMap<_, _> = infos
+        .iter()
+        .filter(|(_peer, info)| {
+            info.listen_addrs
+                .iter()
+                .find(|addr| is_public_address(addr))
+                .is_some()
+        })
+        .collect();
+    println!(
+        "  Peers with public addresses {:?}",
+        peers_with_public_addr.len()
+    );
+    println!(
+        "  Peers with private addresses {:?}",
+        infos.len() - peers_with_public_addr.len()
+    );
+
+    let locator = Locator::new();
+    let mut cities: HashMap<String, usize> = HashMap::new();
+
+    // Construct a new Resolver with default configuration options
+    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default())
+        .expect("Cannot create resolver");
+
+    for (_peer, info) in &peers_with_public_addr {
+        let Some(city) = info
+            .listen_addrs
+            .iter()
+            .find_map(|addr| match addr.iter().next() {
+                Some(Protocol::Ip4(ip)) => locator.locate(IpAddr::V4(ip)),
+                Some(Protocol::Ip6(ip)) => locator.locate(IpAddr::V6(ip)),
+                Some(Protocol::Dns(dns))
+                | Some(Protocol::Dns4(dns))
+                | Some(Protocol::Dns6(dns)) => {
+                    let Ok(lookup) = resolver.lookup_ip(dns.to_string()) else {
+                        return None;
+                    };
+
+                    lookup.iter().find_map(|ip| locator.locate(ip))
+                }
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        cities.entry(city).and_modify(|num| *num += 1).or_insert(1);
+    }
+
+    let mut cities: Vec<_> = cities.iter().collect();
+    cities.sort_by_key(|data| Reverse(*data.1));
+
+    for (city, count) in &cities {
+        println!("   City={:?} peers={:?}", city, count);
+    }
 
     Ok(())
 }

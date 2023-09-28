@@ -36,3 +36,6 @@ codec = { package = "parity-scale-codec", workspace = true, features = ["derive"
 primitive-types = { workspace = true, default-features = false, features = ["codec", "scale-info", "serde"] }
 hex = { workspace = true }
 clap = { workspace = true }
+ip_network = { workspace = true }
+maxminddb = { workspace = true }
+trust-dns-resolver = "0.23.0"
