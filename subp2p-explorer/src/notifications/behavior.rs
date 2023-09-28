@@ -150,7 +150,7 @@ impl NetworkBehaviour for Notifications {
         local_addr: &libp2p::Multiaddr,
         remote_addr: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        log::info!(target: LOG_TARGET, "Notifications new inbound for peer={:?}", peer);
+        log::debug!(target: LOG_TARGET, "Notifications new inbound for peer={:?}", peer);
 
         let handler = NotificationsHandler::new(
             peer,
@@ -171,7 +171,7 @@ impl NetworkBehaviour for Notifications {
         addr: &libp2p::Multiaddr,
         _role_override: libp2p::core::Endpoint,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        log::info!(target: LOG_TARGET, "Notifications new outbound for peer={:?}", peer);
+        log::debug!(target: LOG_TARGET, "Notifications new outbound for peer={:?}", peer);
 
         let handler = NotificationsHandler::new(
             peer,
@@ -232,14 +232,14 @@ impl NetworkBehaviour for Notifications {
                 if let Some(details) = self.peers_details.get_mut(&peer_id) {
                     let removed = details.remove(&connection_id);
                     if !removed {
-                        log::warn!(target: LOG_TARGET,
+                        log::trace!(target: LOG_TARGET,
                             "Notifications swarm connection closed for untracked connection peer={:?} connection={:?}",
                             peer_id,
                             connection_id
                         );
                     }
                 } else {
-                    log::warn!(target: LOG_TARGET,
+                    log::trace!(target: LOG_TARGET,
                         "Notifications swarm connection closed for untracked peer, peer={:?} connection={:?}",
                         peer_id,
                         connection_id
@@ -265,8 +265,8 @@ impl NetworkBehaviour for Notifications {
         connection_id: libp2p::swarm::ConnectionId,
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
-        log::info!(target: LOG_TARGET,
-            " Transactions::on_connection_handler_event peer {:?} {:?}",
+        log::debug!(target: LOG_TARGET,
+            "Notifications new substream for peer {:?} {:?}",
             peer_id,
             event
         );
@@ -279,7 +279,7 @@ impl NetworkBehaviour for Notifications {
                 sender,
                 ..
             } => {
-                log::debug!(target: LOG_TARGET,
+                log::trace!(target: LOG_TARGET,
                     "Notifications handler complited handshake peer={:?} connection={:?} index={:?} handshake={:?}",
                     peer_id,
                     connection_id,
@@ -298,7 +298,7 @@ impl NetworkBehaviour for Notifications {
                 ));
             }
             NotificationsHandlerToBehavior::HandshakeError { index } => {
-                log::debug!(target: LOG_TARGET,
+                log::trace!(target: LOG_TARGET,
                     "Notifications handler error handshake peer={:?} connection={:?} index={:?}",
                     peer_id,
                     connection_id,
