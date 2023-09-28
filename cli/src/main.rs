@@ -16,12 +16,14 @@ use subp2p_explorer::{
 use clap::Parser as ClapParser;
 use futures::StreamExt;
 use libp2p::{
+    identify::Info,
     identity,
+    kad::{GetClosestPeersError, GetClosestPeersOk, KademliaEvent, QueryId, QueryResult},
     swarm::{SwarmBuilder, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use primitive_types::H256;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::error::Error;
 use std::time::Duration;
 
@@ -29,6 +31,7 @@ use std::time::Duration;
 #[derive(Debug, ClapParser)]
 enum Command {
     SendExtrinisic(SendExtrinisicOpts),
+    DiscoverNetwork(DiscoverNetworkOpts),
 }
 
 /// Send extrinsic on the p2p network.
@@ -46,6 +49,20 @@ pub struct SendExtrinisicOpts {
     /// Hex-encoded scale-encoded vector of extrinsics to submit to peers.
     #[clap(long, short)]
     extrinsics: String,
+}
+
+/// Discover the p2p network.
+#[derive(Debug, ClapParser)]
+pub struct DiscoverNetworkOpts {
+    /// Hex-encoded genesis hash of the chain.
+    ///
+    /// For example, "781e4046b4e8b5e83d33dde04b32e7cb5d43344b1f19b574f6d31cbbd99fe738"
+    #[clap(long, short)]
+    genesis: String,
+    /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
+    /// For example, "/ip4/127.0.0.1/tcp/30333/ws/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp".
+    #[clap(long, use_value_delimiter = true, value_parser)]
+    bootnodes: Vec<String>,
 }
 
 fn build_swarm(
@@ -196,6 +213,164 @@ async fn submit_extrinsics(
     Ok(())
 }
 
+struct NetworkDiscovery {
+    /// Drive the network behavior.
+    swarm: Swarm<Behaviour>,
+    /// In flight kademlia queries.
+    queries: HashSet<QueryId>,
+    /// Discovered peers by kademlia queries.
+    discovered: HashSet<PeerId>,
+    /// Discovered peers by kademlia queries.
+    discovered_with_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
+    /// Peer details including protocols, multiaddress.
+    peer_details: HashMap<PeerId, Info>,
+    /// Peers dialed.
+    dialed_peers: HashMap<PeerId, usize>,
+}
+
+impl NetworkDiscovery {
+    /// Constructs a new [`NetworkDiscovery`].
+    pub fn new(swarm: Swarm<Behaviour>) -> Self {
+        Self {
+            swarm,
+            queries: HashSet::with_capacity(1024),
+            discovered: HashSet::with_capacity(1024),
+            discovered_with_addresses: HashMap::with_capacity(1024),
+            peer_details: HashMap::with_capacity(1024),
+            dialed_peers: HashMap::with_capacity(1024),
+        }
+    }
+
+    /// Insert a number of queries to randomly walk the DHT.
+    ///
+    /// Performs a Kademlia query that returns a number of closest peers up to
+    /// the replication factor (k = 20 for substrate chains).
+    fn insert_queries(&mut self, num: usize) {
+        for _ in 0..num {
+            self.queries.insert(
+                self.swarm
+                    .behaviour_mut()
+                    .discovery
+                    .get_closest_peers(PeerId::random()),
+            );
+        }
+    }
+
+    /// Track the dialed peers in response of an [`SwarmEvent::Dialing`] event.
+    fn dialed_peer(&mut self, peer_id: Option<PeerId>) {
+        // Record how many times have we dialed a peer.
+        let Some(peer_id) = peer_id else { return };
+
+        self.dialed_peers
+            .entry(peer_id)
+            .and_modify(|num| *num += 1)
+            .or_insert(0);
+    }
+
+    /// Drive the network behavior events.
+    pub async fn drive_events(&mut self) {
+        // Start by performing 128 queries.
+        self.insert_queries(128);
+
+        loop {
+            let event = self.swarm.select_next_some().await;
+
+            match event {
+                SwarmEvent::Dialing { peer_id, .. } => {
+                    self.dialed_peer(peer_id);
+                }
+
+                SwarmEvent::Behaviour(BehaviourEvent::Discovery(event)) => match event {
+                    KademliaEvent::OutboundQueryProgressed {
+                        id,
+                        result: QueryResult::GetClosestPeers(result),
+                        ..
+                    } => {
+                        self.queries.remove(&id);
+
+                        // It might be possible that the query did not finish in 5 minutes.
+                        // However we capture the provided peers.
+                        let peers = match result {
+                            Ok(GetClosestPeersOk { peers, .. }) => peers,
+                            Err(GetClosestPeersError::Timeout { peers, .. }) => peers,
+                        };
+
+                        self.discovered.extend(peers);
+
+                        if self.queries.is_empty() {
+                            self.insert_queries(128);
+                        }
+                    }
+
+                    KademliaEvent::RoutingUpdated {
+                        peer, addresses, ..
+                    } => {
+                        match self.discovered_with_addresses.entry(peer) {
+                            Entry::Occupied(mut occupied) => {
+                                occupied.get_mut().extend(addresses.into_vec());
+                            }
+                            Entry::Vacant(vacant) => {
+                                vacant.insert(addresses.iter().cloned().collect());
+                            }
+                        };
+                    }
+                    KademliaEvent::RoutablePeer { peer, address }
+                    | KademliaEvent::PendingRoutablePeer { peer, address } => {
+                        match self.discovered_with_addresses.entry(peer) {
+                            Entry::Occupied(mut occupied) => {
+                                occupied.get_mut().insert(address);
+                            }
+                            Entry::Vacant(vacant) => {
+                                let mut set = HashSet::new();
+                                set.insert(address);
+                                vacant.insert(set);
+                            }
+                        };
+                    }
+                    _ => (),
+                },
+
+                SwarmEvent::Behaviour(BehaviourEvent::PeerInfo(info_event)) => match info_event {
+                    PeerInfoEvent::Identified { peer_id, info } => {
+                        log::debug!("Peer identified peer_id={:?} info={:?}", peer_id, info);
+                        self.peer_details.insert(peer_id, info);
+                    }
+                },
+
+                _ => (),
+            }
+        }
+    }
+}
+
+async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let swarm = build_swarm(genesis, bootnodes)?;
+    let mut network_discovery = NetworkDiscovery::new(swarm);
+
+    // Drive network events for 3 minutes.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3 * 60),
+        network_discovery.drive_events(),
+    )
+    .await;
+
+    println!(
+        "Discovered num={} peers",
+        network_discovery.discovered.len()
+    );
+    println!(
+        "Discovered kad with addresses num={} peers",
+        network_discovery.discovered_with_addresses.len()
+    );
+    println!("Dialed num={} peers", network_discovery.dialed_peers.len());
+    println!(
+        "Peers with identity num={}",
+        network_discovery.peer_details.len()
+    );
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt().init();
@@ -205,5 +380,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::SendExtrinisic(opts) => {
             submit_extrinsics(opts.genesis, opts.bootnodes, opts.extrinsics).await
         }
+        Command::DiscoverNetwork(opts) => discover_network(opts.genesis, opts.bootnodes).await,
     }
 }
