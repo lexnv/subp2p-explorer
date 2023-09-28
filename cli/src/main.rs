@@ -219,8 +219,6 @@ struct NetworkDiscovery {
     /// In flight kademlia queries.
     queries: HashSet<QueryId>,
     /// Discovered peers by kademlia queries.
-    discovered: HashSet<PeerId>,
-    /// Discovered peers by kademlia queries.
     discovered_with_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
     /// Peer details including protocols, multiaddress.
     peer_details: HashMap<PeerId, Info>,
@@ -234,7 +232,6 @@ impl NetworkDiscovery {
         Self {
             swarm,
             queries: HashSet::with_capacity(1024),
-            discovered: HashSet::with_capacity(1024),
             discovered_with_addresses: HashMap::with_capacity(1024),
             peer_details: HashMap::with_capacity(1024),
             dialed_peers: HashMap::with_capacity(1024),
@@ -292,18 +289,17 @@ impl NetworkDiscovery {
 
                         // It might be possible that the query did not finish in 5 minutes.
                         // However we capture the provided peers.
+                        // Peers are later reported by kademila events handled below.
                         let peers = match result {
                             Ok(GetClosestPeersOk { peers, .. }) => peers,
                             Err(GetClosestPeersError::Timeout { peers, .. }) => peers,
                         };
                         let num_discovered = peers.len();
 
-                        self.discovered.extend(peers);
-
                         let now = std::time::Instant::now();
                         if now.duration_since(old_log_time) > Duration::from_secs(10) {
                             old_log_time = now;
-                            log::info!("...Discovery in progress last_query_num={num_discovered} total_peers={}", self.discovered.len());
+                            log::info!("...Discovery in progress last_query_num={num_discovered}");
                         }
 
                         if self.queries.is_empty() {
@@ -323,6 +319,7 @@ impl NetworkDiscovery {
                             }
                         };
                     }
+
                     KademliaEvent::RoutablePeer { peer, address }
                     | KademliaEvent::PendingRoutablePeer { peer, address } => {
                         match self.discovered_with_addresses.entry(peer) {
@@ -341,7 +338,7 @@ impl NetworkDiscovery {
 
                 SwarmEvent::Behaviour(BehaviourEvent::PeerInfo(info_event)) => match info_event {
                     PeerInfoEvent::Identified { peer_id, info } => {
-                        log::debug!("Peer identified peer_id={:?} info={:?}", peer_id, info);
+                        log::debug!("Identified peer_id={:?} info={:?}", peer_id, info);
                         self.peer_details.insert(peer_id, info);
                     }
                 },
@@ -353,7 +350,7 @@ impl NetworkDiscovery {
 }
 
 async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(), Box<dyn Error>> {
-    let swarm = build_swarm(genesis, bootnodes)?;
+    let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
 
     // Drive network events for 3 minutes.
@@ -365,17 +362,27 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
 
     println!(
         "Discovered num={} peers",
-        network_discovery.discovered.len()
-    );
-    println!(
-        "Discovered kad with addresses num={} peers",
         network_discovery.discovered_with_addresses.len()
     );
-    println!("Dialed num={} peers", network_discovery.dialed_peers.len());
+
+    let infos: HashMap<_, _> = network_discovery
+        .peer_details
+        .iter()
+        .filter(|(_peer, info)| {
+            info.protocols
+                .iter()
+                .find(|stream_proto| stream_proto.as_ref().contains(&genesis))
+                .is_some()
+        })
+        .collect();
+
     println!(
         "Peers with identity num={}",
         network_discovery.peer_details.len()
     );
+    println!("Peers that support our genesis hash {:?}", infos.len());
+
+    println!("Dialed num={} peers", network_discovery.dialed_peers.len());
 
     Ok(())
 }
