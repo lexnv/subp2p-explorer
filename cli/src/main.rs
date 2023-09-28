@@ -34,7 +34,7 @@ use std::{
 };
 use trust_dns_resolver::{
     config::{ResolverConfig, ResolverOpts},
-    Resolver,
+    TokioAsyncResolver,
 };
 
 /// Command for interacting with the CLI.
@@ -375,7 +375,6 @@ struct Locator {
 }
 
 impl Locator {
-    /// Taken from here: https://github.com/P3TERX/GeoLite.mmdb/releases/tag/2022.06.07
     const CITY_DATA: &'static [u8] = include_bytes!("../../artifacts/GeoLite2-City.mmdb");
 
     pub fn new() -> Self {
@@ -405,7 +404,7 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
 
     // Drive network events for a few minutes.
     let _ = tokio::time::timeout(
-        Duration::from_secs(3 * 60),
+        Duration::from_secs(5 * 60),
         network_discovery.drive_events(),
     )
     .await;
@@ -454,38 +453,41 @@ async fn discover_network(genesis: String, bootnodes: Vec<String>) -> Result<(),
     let locator = Locator::new();
     let mut cities: HashMap<String, usize> = HashMap::new();
 
-    // Construct a new Resolver with default configuration options
-    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default())
-        .expect("Cannot create resolver");
-
-    for (_peer, info) in &peers_with_public_addr {
-        let Some(city) = info
-            .listen_addrs
-            .iter()
-            .find_map(|addr| match addr.iter().next() {
+    // Resolver for DNS addresses.
+    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+    for (_peer, info) in &infos {
+        for addr in &info.listen_addrs {
+            let located = match addr.iter().next() {
                 Some(Protocol::Ip4(ip)) => locator.locate(IpAddr::V4(ip)),
                 Some(Protocol::Ip6(ip)) => locator.locate(IpAddr::V6(ip)),
                 Some(Protocol::Dns(dns))
                 | Some(Protocol::Dns4(dns))
                 | Some(Protocol::Dns6(dns)) => {
-                    let Ok(lookup) = resolver.lookup_ip(dns.to_string()) else {
-                        return None;
+                    let Ok(lookup) = resolver.lookup_ip(dns.to_string()).await else {
+                        continue;
                     };
 
                     lookup.iter().find_map(|ip| locator.locate(ip))
                 }
-                _ => None,
-            })
-        else {
-            continue;
-        };
-        cities.entry(city).and_modify(|num| *num += 1).or_insert(1);
+                _ => continue,
+            };
+
+            let Some(located) = located else { continue };
+
+            cities
+                .entry(located)
+                .and_modify(|num| *num += 1)
+                .or_insert(1);
+
+            break;
+        }
     }
 
+    // Print top 10 cities.
     let mut cities: Vec<_> = cities.iter().collect();
     cities.sort_by_key(|data| Reverse(*data.1));
-
-    for (city, count) in &cities {
+    let mut iter = cities.iter().take(10);
+    while let Some((city, count)) = iter.next() {
         println!("   City={:?} peers={:?}", city, count);
     }
 
