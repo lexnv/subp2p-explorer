@@ -42,6 +42,7 @@ hex = "0.4.3"
 clap = { version = "4.4.4", features = ["derive", "cargo"] }
 ip_network = "0.4.1"
 maxminddb = "0.23.0"
+serde_json = { version = "1.0.108" }
 
 #workspace crates:
 subp2p-explorer = { version = "0.1.0", path = "subp2p-explorer", default-features = false }

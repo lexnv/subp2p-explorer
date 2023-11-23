@@ -75,8 +75,6 @@ impl Bootnodes {
             if let SwarmEvent::Behaviour(event) = swarm.select_next_some().await {
                 match event {
                     identify::Event::Received { peer_id, info } => {
-                        println!("Received identify info from {peer_id:?}: {info:?}");
-
                         // Store the info data to ensure that we validate the protocols supported by the remote peer.
                         self.identify_data.insert(peer_id, info);
 
@@ -132,7 +130,6 @@ pub async fn verify_bootnodes(
         let multiaddress: Multiaddr = bootnode.parse().expect("Valid multiaddress; qed");
         let peer_id: PeerId = peer.parse().expect("Valid peer ID; qed");
 
-        println!("Bootnode peer={:?}", peer_id);
         nodes
             .entry(peer_id)
             .or_insert_with(Vec::new)
@@ -140,8 +137,8 @@ pub async fn verify_bootnodes(
     }
 
     let mut state = Bootnodes::new(nodes.clone(), genesis);
-
     let _ = tokio::time::timeout(Duration::from_secs(25), state.verify_bootnodes()).await;
+    println!();
 
     let valid_bootnodes: Vec<_> = nodes
         .iter()
@@ -159,7 +156,7 @@ pub async fn verify_bootnodes(
                 println!(" {addr}");
             }
         }
-        println!()
+        println!();
     }
 
     if !invalid_bootnodes.is_empty() {
@@ -169,7 +166,7 @@ pub async fn verify_bootnodes(
                 println!(" {addr}");
             }
         }
-        println!()
+        println!();
     }
 
     Ok(())
