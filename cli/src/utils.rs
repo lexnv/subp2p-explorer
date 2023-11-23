@@ -29,11 +29,11 @@ pub struct Locator {
 #[derive(Debug)]
 pub struct Location {
     pub city: String,
-    // pub accuracy_radius: Option<u16>,
-    // pub latitude: Option<f64>,
-    // pub longitude: Option<f64>,
-    // pub metro_code: Option<u16>,
-    // pub time_zone: Option<String>,
+    pub accuracy_radius: Option<u16>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub metro_code: Option<u16>,
+    pub time_zone: Option<String>,
 }
 
 impl Locator {
@@ -48,7 +48,7 @@ impl Locator {
 
     /// Geolocate the IP address and return the location.
     pub fn locate(&self, ip: IpAddr) -> Option<Location> {
-        let City { city, .. } = self.db.lookup(ip).ok()?;
+        let City { city, location, .. } = self.db.lookup(ip).ok()?;
 
         let city = city
             .as_ref()?
@@ -60,18 +60,14 @@ impl Locator {
 
         Some(Location {
             city: city.into_string(),
+            accuracy_radius: location.clone().map(|loc| loc.accuracy_radius).flatten(),
+            latitude: location.clone().map(|loc| loc.latitude).flatten(),
+            longitude: location.clone().map(|loc| loc.longitude).flatten(),
+            metro_code: location.clone().map(|loc| loc.metro_code).flatten(),
+            time_zone: location
+                .map(|loc| loc.time_zone.map(|zone| zone.to_string()))
+                .flatten(),
         })
-
-        // Some(Location {
-        //     city: city.into_string(),
-        //     accuracy_radius: location.clone().map(|loc| loc.accuracy_radius).flatten(),
-        //     latitude: location.clone().map(|loc| loc.latitude).flatten(),
-        //     longitude: location.clone().map(|loc| loc.longitude).flatten(),
-        //     metro_code: location.clone().map(|loc| loc.metro_code).flatten(),
-        //     time_zone: location
-        //         .map(|loc| loc.time_zone.map(|zone| zone.to_string()))
-        //         .flatten(),
-        // })
     }
 }
 

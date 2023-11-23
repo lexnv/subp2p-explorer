@@ -26,7 +26,7 @@ After the crawling is finished, the crawler prints:
 The following command discovers all the peers of the polkadot network:
 
 ```bash
-$ cargo run -- discover-network --genesis 91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3 --bootnodes /dns/polkadot-connect-0.parity.io/tcp/443/wss/p2p/12D3KooWEPmjoRpDSUuiTjvyNDd8fejZ9eNWH5bE965nyBMDrB4o
+$ cargo run -- discover-network --genesis 91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3 --bootnodes /dns/polkadot-connect-0.parity.io/tcp/443/wss/p2p/12D3KooWEPmjoRpDSUuiTjvyNDd8fejZ9eNWH5bE965nyBMDrB4o  --raw-geolocation
 
 INFO subp2p_explorer_cli::utils: Local peer ID PeerId("12D3KooWR5PoNAD5ucbHGnRbywM9tvPyhaWbWLBuYbYm8Q73hjka")
 INFO subp2p_explorer_cli::utils: Bootnode peer=PeerId("12D3KooWNwWNRrPrTk4qMah1YszudMjxNw2qag7Kunhw3Ghs9ea5")
@@ -51,6 +51,11 @@ Peers that support our genesis hash 1404
    City="Toronto" peers=25
    City="Paris" peers=21
    City="Groningen" peers=20
+
+Peer 12D3KooWAdHQjjtvXvkMWMKZYdrnGWG7PQ2Fy4wmUPQEXh9hvcic: Location { city: "Ashburn", accuracy_radius: Some(1000), latitude: Some(39.0469), longitude: Some(-77.4903), metro_code: Some(511), time_zone: Some("America/New_York") }
+Peer 12D3KooWMVnL8PUBor5LEApS8XnnWjj13Hmfmd26kx48uHrvCKAr: Location { city: "Seattle", accuracy_radius: Some(20), latitude: Some(47.6144), longitude: Some(-122.3447), metro_code: Some(819), time_zone: Some("America/Los_Angeles") }
+Peer 12D3KooWAmQnrYxkv3jrH2uMdgw2KM1KHArxKjJmyFbNdgy3Gqm5: Location { city: "Zurich", accuracy_radius: Some(20), latitude: Some(47.3682), longitude: Some(8.5671), metro_code: None, time_zone: Some("Europe/Zurich") }
+Peer 12D3KooWQwMc5utYbnVbB2LDeUY64PHWi1bCwgWScRjJePcSfYqE: Location { city: "Montreal", accuracy_radius: Some(1000), latitude: Some(45.4995), longitude: Some(-73.5848), metro_code: None, time_zone: Some("America/Toronto") }
 ```
 
 ## verify-bootnodes
@@ -62,9 +67,6 @@ A bootnode is considered valid when:
 - It is reachable and responds to the identify p2p protocol "/ipfs/id/1.0.0". For more details see the [libp2p spec](https://github.com/libp2p/specs/blob/master/identify/README.md#identify).
 - If the genesis hash of the chain is provided, the bootnode must have one p2p protocol that derives the genesis hash
   - For example, "/GENESIS/transactions/1", "/GENESIS/kad" etc.
-
-
-
 
 The following command validates the bootnodes of the polkadot chain from the provided chain spec:
 
