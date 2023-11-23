@@ -29,7 +29,7 @@ use libp2p::{
 };
 
 /// The agent client string of this crate.
-const AGENT: &str = "subp2p-agent";
+pub const AGENT: &str = "subp2p-agent";
 const LOG_TARGET: &str = "subp2p-peer-behavior";
 
 /// Accurate p2p behavior as part of the substrate network.
