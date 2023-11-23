@@ -213,7 +213,7 @@ pub async fn discover_network(
 
     // Resolver for DNS addresses.
     let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-    for (_peer, info) in &infos {
+    for info in infos.values() {
         for addr in &info.listen_addrs {
             let located = match addr.iter().next() {
                 Some(Protocol::Ip4(ip)) => locator.locate(IpAddr::V4(ip)),

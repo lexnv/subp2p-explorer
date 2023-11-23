@@ -6,7 +6,9 @@ mod commands;
 mod utils;
 
 use clap::Parser as ClapParser;
-use commands::{discovery::discover_network, extrinsics::submit_extrinsics};
+use commands::{
+    bootnodes::verify_bootnodes, discovery::discover_network, extrinsics::submit_extrinsics,
+};
 use std::error::Error;
 
 /// Command for interacting with the CLI.
@@ -78,6 +80,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             submit_extrinsics(opts.genesis, opts.bootnodes, opts.extrinsics).await
         }
         Command::DiscoverNetwork(opts) => discover_network(opts.genesis, opts.bootnodes).await,
-        Command::VerifyBootnodes(_opts) => Ok(()),
+        Command::VerifyBootnodes(opts) => verify_bootnodes(opts.bootnodes, opts.genesis).await,
     }
 }
