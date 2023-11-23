@@ -2,7 +2,7 @@
 // This file is dual-licensed as Apache-2.0 or GPL-3.0.
 // see LICENSE for license details.
 
-use crate::utils::{build_swarm, is_public_address, Locator};
+use crate::utils::{build_swarm, is_public_address, Location, Locator};
 use futures::StreamExt;
 use libp2p::{
     identify::Info,
@@ -162,6 +162,8 @@ impl NetworkDiscovery {
 pub async fn discover_network(
     genesis: String,
     bootnodes: Vec<String>,
+    num_cities: Option<usize>,
+    raw_geolocation: bool,
 ) -> Result<(), Box<dyn Error>> {
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
@@ -210,10 +212,11 @@ pub async fn discover_network(
 
     let locator = Locator::new();
     let mut cities: HashMap<String, usize> = HashMap::new();
+    let mut geolocated_peers: HashMap<PeerId, Location> = HashMap::new();
 
     // Resolver for DNS addresses.
     let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-    for info in infos.values() {
+    for (peer, info) in infos {
         for addr in &info.listen_addrs {
             let located = match addr.iter().next() {
                 Some(Protocol::Ip4(ip)) => locator.locate(IpAddr::V4(ip)),
@@ -233,20 +236,30 @@ pub async fn discover_network(
             let Some(located) = located else { continue };
 
             cities
-                .entry(located)
+                .entry(located.city.clone())
                 .and_modify(|num| *num += 1)
                 .or_insert(1);
+
+            geolocated_peers.insert(peer.clone(), located);
 
             break;
         }
     }
 
-    // Print top 10 cities.
+    // Print top k cities.
     let mut cities: Vec<_> = cities.iter().collect();
     cities.sort_by_key(|data| Reverse(*data.1));
-    let iter = cities.iter().take(10);
+    let iter = cities.iter().take(num_cities.unwrap_or(10));
     for (city, count) in iter {
-        println!("   City={:?} peers={:?}", city, count);
+        println!("   City={city} peers={count}");
+    }
+
+    if raw_geolocation {
+        println!();
+
+        for (peer, location) in geolocated_peers {
+            println!("   Peer {peer}: {location:?}");
+        }
     }
 
     Ok(())

@@ -39,4 +39,4 @@ hex = { workspace = true }
 clap = { workspace = true }
 ip_network = { workspace = true }
 maxminddb = { workspace = true }
-trust-dns-resolver = "0.23.0"
+trust-dns-resolver = { workspace = true }

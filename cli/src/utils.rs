@@ -20,9 +20,20 @@ use subp2p_explorer::{
     Behaviour,
 };
 
-/// Translate IP addresses to city locations.
+/// Translate IP addresses to locations.
 pub struct Locator {
     db: maxminddb::Reader<&'static [u8]>,
+}
+
+/// The location result of an IP query.
+#[derive(Debug)]
+pub struct Location {
+    pub city: String,
+    // pub accuracy_radius: Option<u16>,
+    // pub latitude: Option<f64>,
+    // pub longitude: Option<f64>,
+    // pub metro_code: Option<u16>,
+    // pub time_zone: Option<String>,
 }
 
 impl Locator {
@@ -35,8 +46,8 @@ impl Locator {
         }
     }
 
-    /// Geolocate the IP address and return the city.
-    pub fn locate(&self, ip: IpAddr) -> Option<String> {
+    /// Geolocate the IP address and return the location.
+    pub fn locate(&self, ip: IpAddr) -> Option<Location> {
         let City { city, .. } = self.db.lookup(ip).ok()?;
 
         let city = city
@@ -47,7 +58,20 @@ impl Locator {
             .to_string()
             .into_boxed_str();
 
-        Some(city.into_string())
+        Some(Location {
+            city: city.into_string(),
+        })
+
+        // Some(Location {
+        //     city: city.into_string(),
+        //     accuracy_radius: location.clone().map(|loc| loc.accuracy_radius).flatten(),
+        //     latitude: location.clone().map(|loc| loc.latitude).flatten(),
+        //     longitude: location.clone().map(|loc| loc.longitude).flatten(),
+        //     metro_code: location.clone().map(|loc| loc.metro_code).flatten(),
+        //     time_zone: location
+        //         .map(|loc| loc.time_zone.map(|zone| zone.to_string()))
+        //         .flatten(),
+        // })
     }
 }
 

@@ -48,6 +48,14 @@ pub struct DiscoverNetworkOpts {
     /// For example, "/ip4/127.0.0.1/tcp/30333/ws/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp".
     #[clap(long, use_value_delimiter = true, value_parser)]
     bootnodes: Vec<String>,
+    /// The number of cities to print in decreasing order by the number of peers.
+    ///
+    /// Defaults to 10.
+    #[clap(long, short)]
+    cities: Option<usize>,
+    /// Print the raw list of peers with geolocation.
+    #[clap(long, short)]
+    raw_geolocation: bool,
 }
 
 /// Verify bootnodes are reachable on the p2p network.
@@ -120,7 +128,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::SendExtrinisic(opts) => {
             submit_extrinsics(opts.genesis, opts.bootnodes, opts.extrinsics).await
         }
-        Command::DiscoverNetwork(opts) => discover_network(opts.genesis, opts.bootnodes).await,
+        Command::DiscoverNetwork(opts) => {
+            discover_network(
+                opts.genesis,
+                opts.bootnodes,
+                opts.cities,
+                opts.raw_geolocation,
+            )
+            .await
+        }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
     }
 }
