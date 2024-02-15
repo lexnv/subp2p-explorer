@@ -56,6 +56,9 @@ pub struct DiscoverNetworkOpts {
     /// Print the raw list of peers with geolocation.
     #[clap(long, short)]
     raw_geolocation: bool,
+    /// Show only authorities.
+    #[clap(long, short)]
+    only_authorities: bool,
 }
 
 /// Verify bootnodes are reachable on the p2p network.
@@ -134,6 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.bootnodes,
                 opts.cities,
                 opts.raw_geolocation,
+                opts.only_authorities,
             )
             .await
         }

@@ -3,6 +3,7 @@
 // see LICENSE for license details.
 
 use crate::utils::{build_swarm, is_public_address, Location, Locator};
+use codec::Decode;
 use futures::StreamExt;
 use libp2p::{
     identify::Info,
@@ -17,7 +18,11 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::IpAddr,
 };
-use subp2p_explorer::{peer_behavior::PeerInfoEvent, Behaviour, BehaviourEvent};
+use subp2p_explorer::{
+    notifications::{behavior::NotificationsToSwarm, messages::ProtocolRole},
+    peer_behavior::PeerInfoEvent,
+    Behaviour, BehaviourEvent,
+};
 use trust_dns_resolver::{
     config::{ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
@@ -32,6 +37,8 @@ struct NetworkDiscovery {
     discovered_with_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
     /// Peer details including protocols, multiaddress.
     peer_details: HashMap<PeerId, Info>,
+    /// Peers that announced their role.
+    peer_role: HashMap<PeerId, ProtocolRole>,
     /// Peers dialed.
     dialed_peers: HashMap<PeerId, usize>,
 }
@@ -44,6 +51,7 @@ impl NetworkDiscovery {
             queries: HashSet::with_capacity(1024),
             discovered_with_addresses: HashMap::with_capacity(1024),
             peer_details: HashMap::with_capacity(1024),
+            peer_role: HashMap::with_capacity(1024),
             dialed_peers: HashMap::with_capacity(1024),
         }
     }
@@ -153,6 +161,29 @@ impl NetworkDiscovery {
                     }
                 },
 
+                SwarmEvent::Behaviour(BehaviourEvent::Notifications(
+                    NotificationsToSwarm::CustomProtocolOpen {
+                        peer_id,
+                        index,
+                        received_handshake,
+                        inbound,
+                        ..
+                    },
+                )) => {
+                    if let Ok(role) = ProtocolRole::decode(&mut &received_handshake[..]) {
+                        log::debug!("Identified peer_id={:?} role={:?}", peer_id, role);
+                        self.peer_role.insert(peer_id, role);
+                    }
+
+                    log::debug!(
+                        "Protocol open peer={:?} index={:?} handshake={:?} inbound={:?}",
+                        peer_id,
+                        index,
+                        received_handshake,
+                        inbound
+                    );
+                }
+
                 _ => (),
             }
         }
@@ -164,6 +195,7 @@ pub async fn discover_network(
     bootnodes: Vec<String>,
     num_cities: Option<usize>,
     raw_geolocation: bool,
+    only_authorities: bool,
 ) -> Result<(), Box<dyn Error>> {
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
@@ -209,6 +241,34 @@ pub async fn discover_network(
         "  Peers with private addresses {:?}",
         infos.len() - peers_with_public_addr.len()
     );
+
+    println!(
+        "Peers with role associated num={}",
+        network_discovery.peer_role.len()
+    );
+
+    if only_authorities {
+        let authorities = network_discovery
+            .peer_role
+            .iter()
+            .filter_map(|(peer, role)| {
+                if *role == ProtocolRole::Authority {
+                    Some(peer)
+                } else {
+                    None
+                }
+            });
+
+        for peer in authorities {
+            println!(
+                "Peer={peer} version={:?}",
+                network_discovery
+                    .peer_details
+                    .get(peer)
+                    .map(|info| info.agent_version.clone())
+            );
+        }
+    }
 
     let locator = Locator::new();
     let mut cities: HashMap<String, usize> = HashMap::new();
