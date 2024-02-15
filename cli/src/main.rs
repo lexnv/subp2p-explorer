@@ -59,6 +59,14 @@ pub struct DiscoverNetworkOpts {
     /// Show only authorities.
     #[clap(long, short)]
     only_authorities: bool,
+    /// The number of seconds the discovery process should run for.
+    #[clap(long, short, value_parser = parse_duration)]
+    timeout: std::time::Duration,
+}
+
+fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
+    let seconds = arg.parse()?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 /// Verify bootnodes are reachable on the p2p network.
@@ -138,6 +146,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.cities,
                 opts.raw_geolocation,
                 opts.only_authorities,
+                opts.timeout,
             )
             .await
         }

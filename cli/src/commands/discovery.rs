@@ -196,16 +196,13 @@ pub async fn discover_network(
     num_cities: Option<usize>,
     raw_geolocation: bool,
     only_authorities: bool,
+    timeout: std::time::Duration,
 ) -> Result<(), Box<dyn Error>> {
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
 
     // Drive network events for a few minutes.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5 * 60),
-        network_discovery.drive_events(),
-    )
-    .await;
+    let _ = tokio::time::timeout(timeout, network_discovery.drive_events()).await;
 
     println!("Dialed num={} peers", network_discovery.dialed_peers.len());
     println!(
@@ -261,7 +258,7 @@ pub async fn discover_network(
 
         for peer in authorities {
             println!(
-                "Peer={peer} version={:?}",
+                "authority={peer} version={:?}",
                 network_discovery
                     .peer_details
                     .get(peer)
