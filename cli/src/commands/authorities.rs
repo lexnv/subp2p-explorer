@@ -1,12 +1,23 @@
+use std::collections::{HashMap, HashSet};
+
 use codec::Decode;
+use futures::StreamExt;
 pub use jsonrpsee::{
     client_transport::ws::{Url, WsTransportClientBuilder},
     core::client::{Client, ClientT},
     rpc_params,
 };
 
-use libp2p::kad::record::Key as KademliaKey;
+use libp2p::{
+    identify::Info,
+    kad::{record::Key as KademliaKey, GetRecordOk, KademliaEvent, QueryId, QueryResult},
+    swarm::SwarmEvent,
+    PeerId, Swarm,
+};
 use multihash_codetable::{Code, MultihashDigest};
+use subp2p_explorer::{Behaviour, BehaviourEvent};
+
+use crate::utils::build_swarm;
 
 const _POLKADOT_URL: &str = "wss://rpc.polkadot.io:443";
 
@@ -49,6 +60,68 @@ fn hash_authority_id(id: &[u8]) -> KademliaKey {
     KademliaKey::new(&Code::Sha2_256.digest(id).digest())
 }
 
+struct AuthorityDiscovery {
+    /// Drive the network behavior.
+    swarm: Swarm<Behaviour>,
+    /// In flight kademlia queries.
+    queries: HashMap<QueryId, sr25519::PublicKey>,
+    /// Peer details including protocols, multiaddress.
+    peer_details: HashMap<PeerId, Info>,
+}
+
+impl AuthorityDiscovery {
+    pub fn new(swarm: Swarm<Behaviour>) -> Self {
+        AuthorityDiscovery {
+            swarm,
+            queries: HashMap::with_capacity(1024),
+            peer_details: HashMap::with_capacity(1024),
+        }
+    }
+
+    fn query_kademlia(&mut self, authorities: Vec<sr25519::PublicKey>) {
+        // Make a query for every authority.
+        for authority in authorities {
+            let key = hash_authority_id(&authority);
+            let id = self.swarm.behaviour_mut().discovery.get_record(key);
+            self.queries.insert(id, authority);
+        }
+    }
+
+    pub async fn discover(&mut self, authorities: Vec<sr25519::PublicKey>) {
+        self.query_kademlia(authorities);
+
+        loop {
+            let event = self.swarm.select_next_some().await;
+
+            match event {
+                SwarmEvent::Behaviour(BehaviourEvent::Discovery(event)) => match event {
+                    KademliaEvent::OutboundQueryProgressed {
+                        id,
+                        result: QueryResult::GetRecord(record),
+                        ..
+                    } => {
+                        let Some(authority) = self.queries.remove(&id) else {
+                            continue;
+                        };
+
+                        println!("record; {:?}", record);
+
+                        match record {
+                            Ok(GetRecordOk::FoundRecord(peer_record)) => {
+                                let value = peer_record.record.value;
+                                println!("authority: {:?} value: {:?}", authority, value);
+                            }
+                            _ => (),
+                        }
+                    }
+                    _ => (),
+                },
+                _ => (),
+            }
+        }
+    }
+}
+
 pub async fn discover_authorities(
     url: String,
     genesis: String,
@@ -60,6 +133,11 @@ pub async fn discover_authorities(
 
     let first = authorities.first().expect("No authorities found");
     let _key = hash_authority_id(first);
+
+    let swarm = build_swarm(genesis.clone(), bootnodes)?;
+    let mut authority_discovery = AuthorityDiscovery::new(swarm);
+
+    authority_discovery.discover(authorities).await;
 
     Ok(())
 }

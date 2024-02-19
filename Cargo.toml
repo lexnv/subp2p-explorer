@@ -50,6 +50,7 @@ multihash-codetable = { version = "0.1.1", features = [
 	"sha2",
 ] }
 jsonrpsee = { version = "0.21", features = ["async-client", "client-ws-transport-native-tls"] }
+prost-build = "0.11"
 
 #workspace crates:
 subp2p-explorer = { version = "0.1.0", path = "subp2p-explorer", default-features = false }
