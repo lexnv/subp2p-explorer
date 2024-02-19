@@ -7,16 +7,35 @@ mod utils;
 
 use clap::Parser as ClapParser;
 use commands::{
-    bootnodes::verify_bootnodes, discovery::discover_network, extrinsics::submit_extrinsics,
+    authorities::discover_authorities, bootnodes::verify_bootnodes, discovery::discover_network,
+    extrinsics::submit_extrinsics,
 };
 use std::{error::Error, io::Read, path::PathBuf};
 
 /// Command for interacting with the CLI.
 #[derive(Debug, ClapParser)]
 enum Command {
+    Authorities(Authorities),
     SendExtrinisic(SendExtrinisicOpts),
     DiscoverNetwork(DiscoverNetworkOpts),
     VerifyBootnodes(BootnodesOpts),
+}
+
+/// Discover the authorities of the p2p network.
+#[derive(Debug, ClapParser)]
+pub struct Authorities {
+    /// The URL of the chain RPC endpoint.
+    #[clap(long, short)]
+    url: String,
+    /// Hex-encoded genesis hash of the chain.
+    ///
+    /// For example, "781e4046b4e8b5e83d33dde04b32e7cb5d43344b1f19b574f6d31cbbd99fe738"
+    #[clap(long, short)]
+    genesis: String,
+    /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
+    /// For example, "/ip4/127.0.0.1/tcp/30333/ws/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp".
+    #[clap(long, use_value_delimiter = true, value_parser)]
+    bootnodes: Vec<String>,
 }
 
 /// Send extrinsic on the p2p network.
@@ -151,5 +170,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await
         }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
+        Command::Authorities(opts) => {
+            discover_authorities(opts.url, opts.genesis, opts.bootnodes).await
+        }
     }
 }

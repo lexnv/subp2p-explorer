@@ -40,3 +40,5 @@ clap = { workspace = true }
 ip_network = { workspace = true }
 maxminddb = { workspace = true }
 trust-dns-resolver = { workspace = true }
+multihash-codetable = { workspace = true, features = ["digest", "serde", "sha2"] }
+jsonrpsee = { workspace = true, features = ["async-client", "client-ws-transport-native-tls"] }

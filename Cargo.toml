@@ -44,6 +44,12 @@ ip_network = "0.4.1"
 maxminddb = "0.23.0"
 serde_json = { version = "1.0.108" }
 trust-dns-resolver = "0.23.0"
+multihash-codetable = { version = "0.1.1", features = [
+	"digest",
+	"serde",
+	"sha2",
+] }
+jsonrpsee = { version = "0.21", features = ["async-client", "client-ws-transport-native-tls"] }
 
 #workspace crates:
 subp2p-explorer = { version = "0.1.0", path = "subp2p-explorer", default-features = false }
