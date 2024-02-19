@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use codec::Decode;
 use futures::StreamExt;
+use hex::decode;
 pub use jsonrpsee::{
     client_transport::ws::{Url, WsTransportClientBuilder},
     core::client::{Client, ClientT},
@@ -12,9 +13,10 @@ use libp2p::{
     identify::Info,
     kad::{record::Key as KademliaKey, GetRecordOk, KademliaEvent, QueryId, QueryResult},
     swarm::SwarmEvent,
-    PeerId, Swarm,
+    Multiaddr, PeerId, Swarm,
 };
 use multihash_codetable::{Code, MultihashDigest};
+use prost::Message;
 use subp2p_explorer::{Behaviour, BehaviourEvent};
 
 use crate::utils::build_swarm;
@@ -58,6 +60,23 @@ async fn runtime_api_autorities(
 
 fn hash_authority_id(id: &[u8]) -> KademliaKey {
     KademliaKey::new(&Code::Sha2_256.digest(id).digest())
+}
+
+mod schema {
+    include!(concat!(env!("OUT_DIR"), "/authority_discovery_v2.rs"));
+}
+
+fn decode_dht_record(value: Vec<u8>) -> Result<Vec<Multiaddr>, Box<dyn std::error::Error>> {
+    let payload = schema::SignedAuthorityRecord::decode(value.as_slice())?;
+    let record = schema::AuthorityRecord::decode(payload.record.as_slice())?;
+
+    let addresses: Vec<Multiaddr> = record
+        .addresses
+        .into_iter()
+        .map(|a| a.try_into())
+        .collect::<std::result::Result<_, _>>()?;
+
+    Ok(addresses)
 }
 
 struct AuthorityDiscovery {
@@ -110,6 +129,11 @@ impl AuthorityDiscovery {
                             Ok(GetRecordOk::FoundRecord(peer_record)) => {
                                 let value = peer_record.record.value;
                                 println!("authority: {:?} value: {:?}", authority, value);
+
+                                let Ok(addresses) = decode_dht_record(value) else {
+                                    continue;
+                                };
+                                println!("Addresses: {:?}\n", addresses);
                             }
                             _ => (),
                         }
