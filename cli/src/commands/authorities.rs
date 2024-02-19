@@ -114,6 +114,8 @@ struct AuthorityDiscovery {
     swarm: Swarm<Behaviour>,
     /// In flight kademlia queries.
     queries: HashMap<QueryId, sr25519::PublicKey>,
+    /// Kademlia queries might produce multiple results for the same entry.
+    permanent_queries: HashMap<QueryId, sr25519::PublicKey>,
     /// In flight kademlia queries.
     queries_discovery: HashSet<QueryId>,
     /// Peer details including protocols, multiaddress from the identify protocol.
@@ -127,7 +129,7 @@ struct PeerDetails {
     /// Authority ID from the runtime API.
     authority_id: sr25519::PublicKey,
     /// Discovered from the DHT.
-    addresses: Vec<Multiaddr>,
+    addresses: HashSet<Multiaddr>,
 }
 
 impl AuthorityDiscovery {
@@ -135,6 +137,7 @@ impl AuthorityDiscovery {
         AuthorityDiscovery {
             swarm,
             queries: HashMap::with_capacity(1024),
+            permanent_queries: HashMap::with_capacity(1024),
             queries_discovery: HashSet::with_capacity(1024),
             peer_info: HashMap::with_capacity(1024),
             peer_details: HashMap::with_capacity(1024),
@@ -150,6 +153,7 @@ impl AuthorityDiscovery {
             let key = hash_authority_id(authority);
             let id = self.swarm.behaviour_mut().discovery.get_record(key);
             self.queries.insert(id, authority.clone());
+            self.permanent_queries.insert(id, authority.clone());
         }
     }
 
@@ -175,10 +179,10 @@ impl AuthorityDiscovery {
 
     pub async fn discover(&mut self, authorities: Vec<sr25519::PublicKey>) {
         let expected_results = authorities.len();
+        let mut dht_errors = 0;
 
+        // At most MAX_QUERIES queries at a time.
         const MAX_QUERIES: usize = 16;
-
-        // At most 32 queries at a time.
         self.query_dht_records(authorities.iter().take(MAX_QUERIES));
         let mut authorities_iter = authorities.iter().skip(MAX_QUERIES);
 
@@ -194,34 +198,45 @@ impl AuthorityDiscovery {
                         result: QueryResult::GetRecord(record),
                         ..
                     }) => {
-                        let Some(authority) = self.queries.remove(&id) else {
-                            continue;
+                        // No longer an active query.
+                        self.queries.remove(&id);
+                        let Some(authority) = self.permanent_queries.get(&id) else {
+                            panic!("Response for another query");
                         };
+                        let authority = *authority;
 
                         match record {
                             Ok(GetRecordOk::FoundRecord(peer_record)) => {
                                 let value = peer_record.record.value;
 
-                                let Ok((peer_id, addresses)) = decode_dht_record(value) else {
-                                    println!(" Decoding DHT failed for authority {:?}", authority);
-                                    continue;
+                                let (peer_id, addresses) = match decode_dht_record(value) {
+                                    Ok((peer_id, addresses)) => (peer_id, addresses),
+                                    Err(e) => {
+                                        println!(
+                                            " Decoding DHT failed for authority {:?}: {:?}",
+                                            authority, e
+                                        );
+                                        dht_errors += 1;
+                                        continue;
+                                    }
                                 };
 
+                                self.peer_details
+                                    .entry(peer_id)
+                                    .and_modify(|entry| entry.addresses.extend(addresses.clone()))
+                                    .or_insert_with(|| PeerDetails {
+                                        authority_id: authority,
+                                        addresses: addresses.iter().cloned().collect(),
+                                    });
+
                                 println!(
-                                    "{}/{} authority: {:?} peer_id {:?} Addresses: {:?}",
-                                    self.peer_details.len() + 1,
+                                    "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",
+                                    self.peer_details.len(),
                                     expected_results,
+                                    dht_errors,
                                     authority,
                                     peer_id,
                                     addresses
-                                );
-
-                                self.peer_details.insert(
-                                    peer_id,
-                                    PeerDetails {
-                                        authority_id: authority,
-                                        addresses: addresses,
-                                    },
                                 );
 
                                 // Add more DHT queries.
@@ -232,7 +247,7 @@ impl AuthorityDiscovery {
                                 }
 
                                 if self.peer_details.len() == expected_results {
-                                    println!("All authorities discovered from DHT");
+                                    println!("All authorities discovered from DHT: Expected {} Errors {}", expected_results, dht_errors);
 
                                     let discovered = self
                                         .peer_details
@@ -399,7 +414,10 @@ pub async fn discover_authorities(
         .collect::<Vec<_>>();
 
     for (peer_id, details) in missing_info {
-        let info = PeerInfo::new(local_key.clone(), details.addresses.clone());
+        let info = PeerInfo::new(
+            local_key.clone(),
+            details.addresses.iter().cloned().collect(),
+        );
         let info = info.discover().await;
         println!("Peer={:?} dial_result={:?}", peer_id, info);
     }
