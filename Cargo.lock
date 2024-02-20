@@ -3435,6 +3435,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
+ "blake2",
+ "bs58",
  "bytes",
  "clap",
  "either",

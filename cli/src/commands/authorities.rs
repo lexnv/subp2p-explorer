@@ -183,7 +183,11 @@ struct AuthorityDiscovery {
     remaining_authorities: HashSet<sr25519::PublicKey>,
     /// Finished DHT queries for authority records.
     finished_query: bool,
+
+    /// Interval at which to resubmit the remaining queries.
     interval: tokio::time::Interval,
+    /// Interval at which to bail out.
+    interval_exit: tokio::time::Interval,
 }
 
 #[derive(Clone)]
@@ -215,6 +219,7 @@ impl AuthorityDiscovery {
             remaining_authorities: authorities.into_iter().collect(),
             finished_query: false,
             interval: tokio::time::interval(std::time::Duration::from_secs(60)),
+            interval_exit: tokio::time::interval(std::time::Duration::from_secs(2 * 60 + 30)),
         }
     }
 
@@ -422,6 +427,7 @@ impl AuthorityDiscovery {
 
         // Should return immediately.
         self.interval.tick().await;
+        self.interval_exit.tick().await;
 
         loop {
             if self.authority_to_details.len() == self.authorities.len() {
@@ -436,6 +442,11 @@ impl AuthorityDiscovery {
 
                 _ = self.interval.tick().fuse() => {
                     self.resubmit_remaining_dht_queries();
+                }
+
+                _ = self.interval_exit.tick().fuse() => {
+                    println!("Exiting due to timeout");
+                    return;
                 }
             }
         }
@@ -511,6 +522,53 @@ impl PeerInfo {
     }
 }
 
+enum VersionRegistry {
+    Polkadot,
+    Substrate,
+    Kusama,
+}
+
+impl VersionRegistry {
+    pub fn to_version(self) -> u16 {
+        match self {
+            VersionRegistry::Polkadot => 0,
+            VersionRegistry::Substrate => 42,
+            VersionRegistry::Kusama => 2,
+        }
+    }
+}
+
+fn ss58hash(data: &[u8]) -> Vec<u8> {
+    use blake2::{Blake2b512, Digest};
+    const PREFIX: &[u8] = b"SS58PRE";
+
+    let mut ctx = Blake2b512::new();
+    ctx.update(PREFIX);
+    ctx.update(data);
+    ctx.finalize().to_vec()
+}
+
+fn to_ss58(key: &sr25519::PublicKey, version: VersionRegistry) -> String {
+    // We mask out the upper two bits of the ident - SS58 Prefix currently only supports 14-bits
+    let ident: u16 = version.to_version() & 0b0011_1111_1111_1111;
+    let mut v = match ident {
+        0..=63 => vec![ident as u8],
+        64..=16_383 => {
+            // upper six bits of the lower byte(!)
+            let first = ((ident & 0b0000_0000_1111_1100) as u8) >> 2;
+            // lower two bits of the lower byte in the high pos,
+            // lower bits of the upper byte in the low pos
+            let second = ((ident >> 8) as u8) | ((ident & 0b0000_0000_0000_0011) as u8) << 6;
+            vec![first | 0b01000000, second]
+        }
+        _ => unreachable!("masked out the upper two bits; qed"),
+    };
+    v.extend(key.as_ref());
+    let r = ss58hash(&v);
+    v.extend(&r[0..2]);
+    bs58::encode(v).into_string()
+}
+
 pub async fn discover_authorities(
     url: String,
     genesis: String,
@@ -530,14 +588,22 @@ pub async fn discover_authorities(
 
     println!("Finished discovery\n");
 
-    for authority in authorities {
-        let Some(details) = authority_discovery.authority_to_details.get(&authority) else {
-            println!("authority={:?} no dht response", authority);
+    let mut reached_peers = 0;
+
+    for authority in &authorities {
+        let Some(details) = authority_discovery.authority_to_details.get(authority) else {
+            println!(
+                "authority={:?} - No dht response",
+                to_ss58(authority, VersionRegistry::Polkadot),
+            );
             continue;
         };
 
         let Some(addr) = details.iter().next() else {
-            println!("authority={:?} no addresses found", authority);
+            println!(
+                "authority={:?} - No addresses found in DHT record",
+                to_ss58(authority, VersionRegistry::Polkadot),
+            );
             continue;
         };
 
@@ -545,35 +611,30 @@ pub async fn discover_authorities(
 
         let info = authority_discovery.peer_info.get(&peer_id).cloned();
         if let Some(info) = info {
+            reached_peers += 1;
+
             println!(
-                "authority={:?} peer_id={:?} version={:?} addresses={:?}",
-                authority, peer_id, info.agent_version, details,
+                "authority={:?} peer_id={:?} addresses={:?} version={:?} ",
+                to_ss58(authority, VersionRegistry::Polkadot),
+                peer_id,
+                info.agent_version,
+                details,
             );
         } else {
             println!(
-                "authority={:?} peer_id={:?} not responding to identify",
-                authority, peer_id
+                "authority={:?} peer_id={:?} addresses={:?} - Cannot be reached",
+                to_ss58(authority, VersionRegistry::Polkadot),
+                peer_id,
+                details,
             );
         }
     }
 
-    // // Some authorities are not reachable directly, ensure we double check them.
-    // let local_key = identity::Keypair::generate_ed25519();
-
-    // let missing_info = authority_discovery
-    //     .peer_details
-    //     .iter()
-    //     .filter(|(peer, _details)| !authority_discovery.peer_info.contains_key(peer))
-    //     .collect::<Vec<_>>();
-
-    // for (peer_id, details) in missing_info {
-    //     let info = PeerInfo::new(
-    //         local_key.clone(),
-    //         details.addresses.iter().cloned().collect(),
-    //     );
-    //     let info = info.discover().await;
-    //     println!("Peer={:?} dial_result={:?}", peer_id, info);
-    // }
+    println!(
+        "\n\n  Discovered {}/{} authorities",
+        reached_peers,
+        authorities.len()
+    );
 
     Ok(())
 }
