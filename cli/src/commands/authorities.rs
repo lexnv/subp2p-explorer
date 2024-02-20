@@ -25,8 +25,7 @@ use subp2p_explorer::{
     Behaviour, BehaviourEvent,
 };
 
-const _POLKADOT_URL: &str = "wss://rpc.polkadot.io:443";
-
+/// Construct a jsonrpc client to communicate with the target node.
 pub async fn client(url: Url) -> Result<Client, Box<dyn std::error::Error>> {
     let (sender, receiver) = WsTransportClientBuilder::default().build(url).await?;
 
@@ -35,6 +34,7 @@ pub async fn client(url: Url) -> Result<Client, Box<dyn std::error::Error>> {
         .build_with_tokio(sender, receiver))
 }
 
+/// Polkadot crypto module.
 mod sr25519 {
     /// Public key for sr25519 keypair implementation.
     pub type PublicKey = [u8; 32];
@@ -59,6 +59,10 @@ mod sr25519 {
     }
 }
 
+/// Call the runtime API of the target node to retrive the current set
+/// of authorities.
+///
+/// This method calls into `AuthorityDiscoveryApi_authorities` runtime API.
 async fn runtime_api_autorities(
     url: Url,
 ) -> Result<Vec<sr25519::PublicKey>, Box<dyn std::error::Error>> {
@@ -81,17 +85,21 @@ async fn runtime_api_autorities(
     Ok(authorities)
 }
 
+/// Hash the authority ID to obtain the kademlia key at which the record
+/// of the authority is stored on the p2p network.
 fn hash_authority_id(id: &[u8]) -> KademliaKey {
     KademliaKey::new(&Code::Sha2_256.digest(id).digest())
 }
 
-// At most MAX_QUERIES queries at a time.
-const MAX_QUERIES: usize = 16;
+/// The maximum number of Kademlia `get-records` queried a time.
+const MAX_QUERIES: usize = 8;
 
+/// Protobuf schema for decoding the authority records from the DHT.
 mod schema {
     include!(concat!(env!("OUT_DIR"), "/authority_discovery_v2.rs"));
 }
 
+/// Get the peerId from a p2p multiaddress.
 fn get_peer_id(address: &Multiaddr) -> Option<PeerId> {
     match address.iter().last() {
         Some(multiaddr::Protocol::P2p(key)) => Some(key),
@@ -99,6 +107,15 @@ fn get_peer_id(address: &Multiaddr) -> Option<PeerId> {
     }
 }
 
+/// Decode the DHT payload and verify the signatures.
+///
+/// The DHT payload is composed:
+///  - `record` - The authority record containing the addresses of the authority.
+///  - `auth_signature` - The signature of the authority over the `record`.
+///  - `peer_signature` - The signature of the peer over the `record`.
+///
+/// The record must contain at least one address in order to discover the peer
+/// identity of the authority.
 fn decode_dht_record(
     value: Vec<u8>,
     authority_id: &sr25519::PublicKey,
@@ -152,58 +169,59 @@ fn decode_dht_record(
     Ok((peer_id, addresses))
 }
 
+/// Discover the authorities on the network.
 struct AuthorityDiscovery {
     /// Drive the network behavior.
     swarm: Swarm<Behaviour>,
-    /// In flight kademlia queries.
+
+    /// In flight `get-record` kademlia queries to ensure that a maximum of `MAX_QUERIES` are in flight.
     queries: HashMap<QueryId, sr25519::PublicKey>,
-    /// Kademlia queries might produce multiple results for the same entry.
-    permanent_queries: HashMap<QueryId, sr25519::PublicKey>,
+    /// In flight `get-closest-peers` kademlia queries to force the discovery of unidentified peers.
+    queries_discovery: HashSet<QueryId>,
 
     /// Map the in-flight kademlia queries to the authority ids.
     records_keys: HashMap<KademliaKey, sr25519::PublicKey>,
-
-    /// In flight kademlia queries.
-    queries_discovery: HashSet<QueryId>,
-    /// Peer details including protocols, multiaddress from the identify protocol.
-    peer_info: HashMap<PeerId, Info>,
-    /// Peer details obtained from the DHT.
+    /// Peer details obtained from the DHT records.
     peer_details: HashMap<PeerId, PeerDetails>,
-
+    /// Peer information from the identify protocol. This includes the version of the peer.
+    peer_info: HashMap<PeerId, Info>,
     authority_to_details: HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
 
-    /// Provided authority list.
+    /// Initially provided authority list.
     authorities: Vec<sr25519::PublicKey>,
     /// Query index.
     query_index: usize,
 
     /// Encountered DHT errors, either from decoding or protocol transport.
     dht_errors: usize,
+
     /// Remaining authorities to query.
     remaining_authorities: HashSet<sr25519::PublicKey>,
     /// Finished DHT queries for authority records.
     finished_query: bool,
 
     /// Interval at which to resubmit the remaining queries.
-    interval: tokio::time::Interval,
+    interval_resubmit: tokio::time::Interval,
     /// Interval at which to bail out.
     interval_exit: tokio::time::Interval,
 }
 
+/// The peer details extracted from the DHT.
 #[derive(Clone)]
 struct PeerDetails {
     /// Authority ID from the runtime API.
+    #[allow(unused)]
     authority_id: sr25519::PublicKey,
     /// Discovered from the DHT.
     addresses: HashSet<Multiaddr>,
 }
 
 impl AuthorityDiscovery {
+    /// Constructs a new [`AuthorityDiscovery`].
     pub fn new(swarm: Swarm<Behaviour>, authorities: Vec<sr25519::PublicKey>) -> Self {
         AuthorityDiscovery {
             swarm,
             queries: HashMap::with_capacity(1024),
-            permanent_queries: HashMap::with_capacity(1024),
 
             records_keys: HashMap::with_capacity(1024),
 
@@ -218,11 +236,12 @@ impl AuthorityDiscovery {
             dht_errors: 0,
             remaining_authorities: authorities.into_iter().collect(),
             finished_query: false,
-            interval: tokio::time::interval(std::time::Duration::from_secs(60)),
+            interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(60)),
             interval_exit: tokio::time::interval(std::time::Duration::from_secs(2 * 60 + 30)),
         }
     }
 
+    /// Query the DHT for the records of the authorities.
     fn query_dht_records(&mut self, authorities: impl IntoIterator<Item = sr25519::PublicKey>) {
         // Make a query for every authority.
         for authority in authorities {
@@ -231,12 +250,18 @@ impl AuthorityDiscovery {
 
             let id = self.swarm.behaviour_mut().discovery.get_record(key);
             self.queries.insert(id, authority.clone());
-            self.permanent_queries.insert(id, authority.clone());
         }
     }
 
+    /// Query the DHT for the closest peers of the authorities that
+    /// are not reacheable at the moment. This function is called
+    /// after the authorities are discovered from the DHT to avoid
+    /// running out of file descriptors.
+    ///
+    /// Note: they may never be reachable due to NAT.
     fn query_peer_info(&mut self) {
-        const MAX_QUERIES: usize = 128;
+        // This is not correlated with the `MAX_QUERIES`.
+        const MAX_DISCOVERY_QUERIES: usize = 8;
 
         let peers = self.peer_details.keys().cloned().filter_map(|peer| {
             if self.peer_info.contains_key(&peer) {
@@ -246,8 +271,8 @@ impl AuthorityDiscovery {
             }
         });
 
-        if self.queries_discovery.len() < MAX_QUERIES {
-            let query_num = MAX_QUERIES - self.queries_discovery.len();
+        if self.queries_discovery.len() < MAX_DISCOVERY_QUERIES {
+            let query_num = MAX_DISCOVERY_QUERIES - self.queries_discovery.len();
             for peer in peers.take(query_num) {
                 self.queries_discovery
                     .insert(self.swarm.behaviour_mut().discovery.get_closest_peers(peer));
@@ -255,15 +280,22 @@ impl AuthorityDiscovery {
         }
     }
 
-    fn advanced_dht_queries(&mut self) {
+    /// Submit at most `MAX_QUERIES` DHT queries to find authority records.
+    ///
+    /// After one query is submitted for every authority this method will
+    /// resubmit the DHT queries for the remaining authorities.
+    fn advance_dht_queries(&mut self) {
         // Add more DHT queries.
         while self.queries.len() < MAX_QUERIES {
             if let Some(next) = self.authorities.get(self.query_index) {
                 self.query_dht_records(std::iter::once(next.clone()));
                 self.query_index += 1;
             } else {
+                if self.queries.is_empty() {
+                    self.resubmit_remaining_dht_queries();
+                }
                 println!(
-                    "queries: {} remaining {}",
+                    "queries: {} remaining authorities to discover {}",
                     self.queries.len(),
                     self.remaining_authorities.len()
                 );
@@ -271,15 +303,24 @@ impl AuthorityDiscovery {
                 break;
             }
         }
+
+        self.query_peer_info();
     }
 
+    /// Submit the DHT queries for the remaining authorities that did not receive a record yet.
+    ///
+    /// When the number of remaining authorities gets below a threashold (`MAX_QUERIES`),
+    /// this method will also submit the `get-closest-peers` queries to force the discovery
+    /// of the peers that are not reachable at the moment.
     fn resubmit_remaining_dht_queries(&mut self) {
         // Ignore older queries.
-        self.queries = HashMap::with_capacity(1024);
+        self.queries.clear();
 
         let authorities = self.remaining_authorities.clone();
         let mut remaining: Vec<_> = authorities.iter().collect();
         remaining.shuffle(&mut thread_rng());
+
+        let remaining_len = remaining.len();
 
         println!(
             " Remaining authorities: {}",
@@ -287,8 +328,13 @@ impl AuthorityDiscovery {
         );
 
         self.query_dht_records(remaining.into_iter().take(MAX_QUERIES).cloned());
+
+        if remaining_len < MAX_QUERIES {
+            self.query_peer_info();
+        }
     }
 
+    /// Handle a swarm event from the p2p network.
     fn handle_swarm<T>(&mut self, event: SwarmEvent<BehaviourEvent, T>) {
         match event {
             // Discovery DHT record.
@@ -299,7 +345,7 @@ impl AuthorityDiscovery {
                         result: QueryResult::GetRecord(record),
                         ..
                     }) => {
-                        // Has received at least one answer for this.
+                        // Has received at least one answer for this and can advance the queries.
                         self.queries.remove(&id);
 
                         match record {
@@ -307,9 +353,10 @@ impl AuthorityDiscovery {
                                 let key = peer_record.record.key;
                                 let value = peer_record.record.value;
 
-                                let Some(authority) = self.records_keys.remove(&key) else {
+                                let Some(authority) = self.records_keys.get(&key) else {
                                     return;
                                 };
+                                let authority = *authority;
 
                                 let (peer_id, addresses) =
                                     match decode_dht_record(value, &authority) {
@@ -348,31 +395,7 @@ impl AuthorityDiscovery {
                                 );
 
                                 self.remaining_authorities.remove(&authority);
-                                self.advanced_dht_queries();
-
-                                if self.peer_details.len() == self.authorities.len() {
-                                    println!("All authorities discovered from DHT: Expected {} Errors {}", self.authorities.len(), self.dht_errors);
-
-                                    let discovered = self
-                                        .peer_details
-                                        .keys()
-                                        .filter_map(|peer| self.peer_info.get(peer))
-                                        .count();
-                                    println!(
-                                        "Fully discovered at the moment {}/{}",
-                                        discovered,
-                                        self.authorities.len()
-                                    );
-
-                                    for peer in self.peer_details.keys() {
-                                        if self.peer_info.contains_key(peer) {
-                                            let _ = self.swarm.disconnect_peer_id(peer.clone());
-                                        }
-                                    }
-
-                                    self.query_peer_info();
-                                    self.finished_query = true;
-                                }
+                                self.advance_dht_queries();
                             }
                             _ => (),
                         }
@@ -422,30 +445,31 @@ impl AuthorityDiscovery {
         }
     }
 
+    /// Run the discovery process.
     pub async fn discover(&mut self) {
-        self.advanced_dht_queries();
+        self.advance_dht_queries();
 
         // Should return immediately.
-        self.interval.tick().await;
+        self.interval_resubmit.tick().await;
         self.interval_exit.tick().await;
 
         loop {
-            if self.authority_to_details.len() == self.authorities.len() {
-                println!("All authorities discovered from DHT");
-                break;
-            }
-
             futures::select! {
                 event = self.swarm.select_next_some().fuse() => {
                     self.handle_swarm(event);
                 },
 
-                _ = self.interval.tick().fuse() => {
+                _ = self.interval_resubmit.tick().fuse() => {
                     self.resubmit_remaining_dht_queries();
                 }
 
                 _ = self.interval_exit.tick().fuse() => {
-                    println!("Exiting due to timeout");
+                    if self.authority_to_details.len() == self.authorities.len() {
+                        println!("All authorities discovered from DHT");
+                    } else {
+                        println!("Exiting due to timeout");
+                    }
+
                     return;
                 }
             }
@@ -470,11 +494,13 @@ impl AuthorityDiscovery {
 /// let info = info.discover().await;
 /// println!("Peer={:?} version={:?}", peer_id, info);
 /// ```
+#[allow(unused)]
 struct PeerInfo {
     swarm: Swarm<libp2p::identify::Behaviour>,
 }
 
 impl PeerInfo {
+    #[allow(unused)]
     pub fn new(local_key: Keypair, addresses: Vec<Multiaddr>) -> Self {
         // "/ip4/144.76.115.244/tcp/30333/p2p/12D3KooWKR7TX55EnZ6L6FUHfuZKAEgkL8ffE3KFYqnHZUysSVrW"
         let mut swarm: Swarm<libp2p::identify::Behaviour> = {
@@ -502,6 +528,7 @@ impl PeerInfo {
         PeerInfo { swarm }
     }
 
+    #[allow(unused)]
     pub async fn discover(mut self) -> Result<Info, DialError> {
         loop {
             let event = self.swarm.select_next_some().await;
@@ -522,6 +549,10 @@ impl PeerInfo {
     }
 }
 
+/// The version registry of the chain.
+///
+/// This information is used for the SS58 encoding.
+#[allow(unused)]
 enum VersionRegistry {
     Polkadot,
     Substrate,
@@ -569,6 +600,7 @@ fn to_ss58(key: &sr25519::PublicKey, version: VersionRegistry) -> String {
     bs58::encode(v).into_string()
 }
 
+/// Entry function called from the CLI.
 pub async fn discover_authorities(
     url: String,
     genesis: String,
@@ -585,7 +617,6 @@ pub async fn discover_authorities(
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone());
     authority_discovery.discover().await;
-
     println!("Finished discovery\n");
 
     let mut reached_peers = 0;
