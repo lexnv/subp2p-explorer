@@ -9,7 +9,7 @@ use jsonrpsee::{
 };
 use libp2p::{
     identify::Info,
-    identity::{self, Keypair},
+    identity::Keypair,
     kad::{record::Key as KademliaKey, GetRecordOk, KademliaEvent, QueryId, QueryResult},
     multiaddr,
     swarm::{DialError, SwarmEvent},
@@ -18,10 +18,7 @@ use libp2p::{
 use multihash_codetable::{Code, MultihashDigest};
 use prost::Message;
 use rand::{seq::SliceRandom, thread_rng};
-use std::{
-    collections::{HashMap, HashSet},
-    usize::MAX,
-};
+use std::collections::{HashMap, HashSet};
 use subp2p_explorer::{
     peer_behavior::PeerInfoEvent,
     transport::{TransportBuilder, MIB},
@@ -128,6 +125,10 @@ struct AuthorityDiscovery {
     queries: HashMap<QueryId, sr25519::PublicKey>,
     /// Kademlia queries might produce multiple results for the same entry.
     permanent_queries: HashMap<QueryId, sr25519::PublicKey>,
+
+    /// Map the in-flight kademlia queries to the authority ids.
+    records_keys: HashMap<KademliaKey, sr25519::PublicKey>,
+
     /// In flight kademlia queries.
     queries_discovery: HashSet<QueryId>,
     /// Peer details including protocols, multiaddress from the identify protocol.
@@ -165,6 +166,9 @@ impl AuthorityDiscovery {
             swarm,
             queries: HashMap::with_capacity(1024),
             permanent_queries: HashMap::with_capacity(1024),
+
+            records_keys: HashMap::with_capacity(1024),
+
             queries_discovery: HashSet::with_capacity(1024),
             peer_info: HashMap::with_capacity(1024),
             peer_details: HashMap::with_capacity(1024),
@@ -184,6 +188,8 @@ impl AuthorityDiscovery {
         // Make a query for every authority.
         for authority in authorities {
             let key = hash_authority_id(&authority);
+            self.records_keys.insert(key.clone(), authority);
+
             let id = self.swarm.behaviour_mut().discovery.get_record(key);
             self.queries.insert(id, authority.clone());
             self.permanent_queries.insert(id, authority.clone());
@@ -256,14 +262,15 @@ impl AuthorityDiscovery {
                     }) => {
                         // Has received at least one answer for this.
                         self.queries.remove(&id);
-                        let Some(authority) = self.permanent_queries.get(&id) else {
-                            panic!("Did not expect a query for {:?}", id)
-                        };
-                        let authority = *authority;
 
                         match record {
                             Ok(GetRecordOk::FoundRecord(peer_record)) => {
+                                let key = peer_record.record.key;
                                 let value = peer_record.record.value;
+
+                                let Some(authority) = self.records_keys.remove(&key) else {
+                                    return;
+                                };
 
                                 let (peer_id, addresses) = match decode_dht_record(value) {
                                     Ok((peer_id, addresses)) => (peer_id, addresses),
