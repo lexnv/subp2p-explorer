@@ -24,6 +24,7 @@ use subp2p_explorer::{
     transport::{TransportBuilder, MIB},
     Behaviour, BehaviourEvent,
 };
+use trust_dns_resolver::proto::op::query;
 
 /// Construct a jsonrpc client to communicate with the target node.
 pub async fn client(url: Url) -> Result<Client, Box<dyn std::error::Error>> {
@@ -265,21 +266,17 @@ impl AuthorityDiscovery {
     /// Note: they may never be reachable due to NAT.
     fn query_peer_info(&mut self) {
         // This is not correlated with the `MAX_QUERIES`.
-        const MAX_DISCOVERY_QUERIES: usize = 8;
-
-        let peers = self.peer_details.keys().cloned().filter_map(|peer| {
-            if self.peer_info.contains_key(&peer) {
-                None
-            } else {
-                Some(peer)
-            }
-        });
+        const MAX_DISCOVERY_QUERIES: usize = 32;
 
         if self.queries_discovery.len() < MAX_DISCOVERY_QUERIES {
             let query_num = MAX_DISCOVERY_QUERIES - self.queries_discovery.len();
-            for peer in peers.take(query_num) {
-                self.queries_discovery
-                    .insert(self.swarm.behaviour_mut().discovery.get_closest_peers(peer));
+            for _ in 0..query_num {
+                self.queries_discovery.insert(
+                    self.swarm
+                        .behaviour_mut()
+                        .discovery
+                        .get_closest_peers(PeerId::random()),
+                );
             }
         }
     }
@@ -405,13 +402,15 @@ impl AuthorityDiscovery {
                                 {
                                     self.old_log = now;
                                     log::info!(
-                                        "... DHT records {}/{} (err {}) | Identified {}/{} | authority={:?} peer_id={:?} addresses={:?}",
+                                        "... DHT records {}/{} (err {}) | Identified {}/{} | Active peer queries {} | authority={:?} peer_id={:?} addresses={:?}",
                                         self.authority_to_details.len(),
                                         self.authorities.len(),
                                         self.dht_errors,
 
                                         self.peer_details.keys().filter_map(|peer| self.peer_info.get(peer)).count(),
                                         self.peer_details.keys().count(),
+
+                                        self.queries_discovery.len(),
 
                                         authority,
                                         peer_id,
@@ -691,6 +690,8 @@ pub async fn discover_authorities(
         reached_peers,
         authorities.len()
     );
+
+    println!(" Discovered peers {}", authority_discovery.peer_info.len());
 
     Ok(())
 }
