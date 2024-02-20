@@ -200,6 +200,8 @@ struct AuthorityDiscovery {
     /// Finished DHT queries for authority records.
     finished_query: bool,
 
+    /// Time of the last log line.
+    old_log: std::time::Instant,
     /// Interval at which to resubmit the remaining queries.
     interval_resubmit: tokio::time::Interval,
     /// Interval at which to bail out.
@@ -236,8 +238,10 @@ impl AuthorityDiscovery {
             dht_errors: 0,
             remaining_authorities: authorities.into_iter().collect(),
             finished_query: false,
+
+            old_log: std::time::Instant::now(),
             interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(60)),
-            interval_exit: tokio::time::interval(std::time::Duration::from_secs(2 * 60 + 30)),
+            interval_exit: tokio::time::interval(std::time::Duration::from_secs(4 * 60)),
         }
     }
 
@@ -294,7 +298,7 @@ impl AuthorityDiscovery {
                 if self.queries.is_empty() {
                     self.resubmit_remaining_dht_queries();
                 }
-                println!(
+                log::debug!(
                     "queries: {} remaining authorities to discover {}",
                     self.queries.len(),
                     self.remaining_authorities.len()
@@ -322,7 +326,7 @@ impl AuthorityDiscovery {
 
         let remaining_len = remaining.len();
 
-        println!(
+        log::debug!(
             " Remaining authorities: {}",
             self.remaining_authorities.len()
         );
@@ -362,9 +366,10 @@ impl AuthorityDiscovery {
                                     match decode_dht_record(value, &authority) {
                                         Ok((peer_id, addresses)) => (peer_id, addresses),
                                         Err(e) => {
-                                            println!(
+                                            log::debug!(
                                                 " Decoding DHT failed for authority {:?}: {:?}",
-                                                authority, e
+                                                authority,
+                                                e
                                             );
                                             self.dht_errors += 1;
                                             return;
@@ -384,7 +389,7 @@ impl AuthorityDiscovery {
                                         addresses: addresses.iter().cloned().collect(),
                                     });
 
-                                println!(
+                                log::debug!(
                                     "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",
                                     self.authority_to_details.len(),
                                     self.authorities.len(),
@@ -393,6 +398,26 @@ impl AuthorityDiscovery {
                                     peer_id,
                                     addresses
                                 );
+
+                                let now = std::time::Instant::now();
+                                if now.duration_since(self.old_log)
+                                    > std::time::Duration::from_secs(10)
+                                {
+                                    self.old_log = now;
+                                    log::info!(
+                                        "... DHT records {}/{} (err {}) | Identified {}/{} | authority={:?} peer_id={:?} addresses={:?}",
+                                        self.authority_to_details.len(),
+                                        self.authorities.len(),
+                                        self.dht_errors,
+
+                                        self.peer_details.keys().filter_map(|peer| self.peer_info.get(peer)).count(),
+                                        self.peer_details.keys().count(),
+
+                                        authority,
+                                        peer_id,
+                                        addresses
+                                    );
+                                }
 
                                 self.remaining_authorities.remove(&authority);
                                 self.advance_dht_queries();
@@ -407,7 +432,7 @@ impl AuthorityDiscovery {
                         ..
                     }) => {
                         if self.finished_query {
-                            println!(" Discovered closes peers of {:?}", id);
+                            log::debug!(" Discovered closes peers of {:?}", id);
                         }
 
                         self.queries_discovery.remove(&id);
@@ -424,7 +449,7 @@ impl AuthorityDiscovery {
                                         .filter_map(|peer| self.peer_info.get(peer))
                                         .count();
 
-                                    println!(
+                                    log::debug!(
                                         " {}/{} Info event {:?}",
                                         discovered,
                                         self.authorities.len(),
@@ -465,9 +490,9 @@ impl AuthorityDiscovery {
 
                 _ = self.interval_exit.tick().fuse() => {
                     if self.authority_to_details.len() == self.authorities.len() {
-                        println!("All authorities discovered from DHT");
+                        log::info!("All authorities discovered from DHT");
                     } else {
-                        println!("Exiting due to timeout");
+                        log::info!("Exiting due to timeout");
                     }
 
                     return;
@@ -617,7 +642,7 @@ pub async fn discover_authorities(
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
     let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone());
     authority_discovery.discover().await;
-    println!("Finished discovery\n");
+    log::info!("Finished discovery\n");
 
     let mut reached_peers = 0;
 
