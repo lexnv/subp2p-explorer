@@ -1,5 +1,6 @@
 use crate::utils::build_swarm;
 use codec::Decode;
+use futures::FutureExt;
 use futures::StreamExt;
 use jsonrpsee::{
     client_transport::ws::{Url, WsTransportClientBuilder},
@@ -16,7 +17,11 @@ use libp2p::{
 };
 use multihash_codetable::{Code, MultihashDigest};
 use prost::Message;
-use std::collections::{HashMap, HashSet};
+use rand::{seq::SliceRandom, thread_rng};
+use std::{
+    collections::{HashMap, HashSet},
+    usize::MAX,
+};
 use subp2p_explorer::{
     peer_behavior::PeerInfoEvent,
     transport::{TransportBuilder, MIB},
@@ -64,6 +69,9 @@ fn hash_authority_id(id: &[u8]) -> KademliaKey {
     KademliaKey::new(&Code::Sha2_256.digest(id).digest())
 }
 
+// At most MAX_QUERIES queries at a time.
+const MAX_QUERIES: usize = 16;
+
 mod schema {
     include!(concat!(env!("OUT_DIR"), "/authority_discovery_v2.rs"));
 }
@@ -106,6 +114,10 @@ fn decode_dht_record(
         .expect("At least one peerId; qed")
         .clone();
 
+    let Some(peer_signature) = payload.peer_signature else {
+        return Err("Payload is not signed".into());
+    };
+
     Ok((peer_id, addresses))
 }
 
@@ -122,6 +134,21 @@ struct AuthorityDiscovery {
     peer_info: HashMap<PeerId, Info>,
     /// Peer details obtained from the DHT.
     peer_details: HashMap<PeerId, PeerDetails>,
+
+    authority_to_details: HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
+
+    /// Provided authority list.
+    authorities: Vec<sr25519::PublicKey>,
+    /// Query index.
+    query_index: usize,
+
+    /// Encountered DHT errors, either from decoding or protocol transport.
+    dht_errors: usize,
+    /// Remaining authorities to query.
+    remaining_authorities: HashSet<sr25519::PublicKey>,
+    /// Finished DHT queries for authority records.
+    finished_query: bool,
+    interval: tokio::time::Interval,
 }
 
 #[derive(Clone)]
@@ -133,7 +160,7 @@ struct PeerDetails {
 }
 
 impl AuthorityDiscovery {
-    pub fn new(swarm: Swarm<Behaviour>) -> Self {
+    pub fn new(swarm: Swarm<Behaviour>, authorities: Vec<sr25519::PublicKey>) -> Self {
         AuthorityDiscovery {
             swarm,
             queries: HashMap::with_capacity(1024),
@@ -141,16 +168,22 @@ impl AuthorityDiscovery {
             queries_discovery: HashSet::with_capacity(1024),
             peer_info: HashMap::with_capacity(1024),
             peer_details: HashMap::with_capacity(1024),
+            authority_to_details: HashMap::with_capacity(1024),
+
+            authorities: authorities.clone(),
+            query_index: 0,
+
+            dht_errors: 0,
+            remaining_authorities: authorities.into_iter().collect(),
+            finished_query: false,
+            interval: tokio::time::interval(std::time::Duration::from_secs(60)),
         }
     }
 
-    fn query_dht_records<'key>(
-        &mut self,
-        authorities: impl IntoIterator<Item = &'key sr25519::PublicKey>,
-    ) {
+    fn query_dht_records(&mut self, authorities: impl IntoIterator<Item = sr25519::PublicKey>) {
         // Make a query for every authority.
         for authority in authorities {
-            let key = hash_authority_id(authority);
+            let key = hash_authority_id(&authority);
             let id = self.swarm.behaviour_mut().discovery.get_record(key);
             self.queries.insert(id, authority.clone());
             self.permanent_queries.insert(id, authority.clone());
@@ -177,31 +210,54 @@ impl AuthorityDiscovery {
         }
     }
 
-    pub async fn discover(&mut self, authorities: Vec<sr25519::PublicKey>) {
-        let expected_results = authorities.len();
-        let mut dht_errors = 0;
+    fn advanced_dht_queries(&mut self) {
+        // Add more DHT queries.
+        while self.queries.len() < MAX_QUERIES {
+            if let Some(next) = self.authorities.get(self.query_index) {
+                self.query_dht_records(std::iter::once(next.clone()));
+                self.query_index += 1;
+            } else {
+                println!(
+                    "queries: {} remaining {}",
+                    self.queries.len(),
+                    self.remaining_authorities.len()
+                );
 
-        // At most MAX_QUERIES queries at a time.
-        const MAX_QUERIES: usize = 16;
-        self.query_dht_records(authorities.iter().take(MAX_QUERIES));
-        let mut authorities_iter = authorities.iter().skip(MAX_QUERIES);
+                break;
+            }
+        }
+    }
 
-        let mut finished_records = false;
+    fn resubmit_remaining_dht_queries(&mut self) {
+        // Ignore older queries.
+        self.queries = HashMap::with_capacity(1024);
 
-        loop {
-            let event = self.swarm.select_next_some().await;
-            match event {
-                // Discovery DHT record.
-                SwarmEvent::Behaviour(behavior_event) => match behavior_event {
+        let authorities = self.remaining_authorities.clone();
+        let mut remaining: Vec<_> = authorities.iter().collect();
+        remaining.shuffle(&mut thread_rng());
+
+        println!(
+            " Remaining authorities: {}",
+            self.remaining_authorities.len()
+        );
+
+        self.query_dht_records(remaining.into_iter().take(MAX_QUERIES).cloned());
+    }
+
+    fn handle_swarm<T>(&mut self, event: SwarmEvent<BehaviourEvent, T>) {
+        match event {
+            // Discovery DHT record.
+            SwarmEvent::Behaviour(behavior_event) => {
+                match behavior_event {
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
                         id,
                         result: QueryResult::GetRecord(record),
                         ..
                     }) => {
-                        // No longer an active query.
+                        // Has received at least one answer for this.
                         self.queries.remove(&id);
                         let Some(authority) = self.permanent_queries.get(&id) else {
-                            panic!("Response for another query");
+                            panic!("Did not expect a query for {:?}", id)
                         };
                         let authority = *authority;
 
@@ -216,10 +272,15 @@ impl AuthorityDiscovery {
                                             " Decoding DHT failed for authority {:?}: {:?}",
                                             authority, e
                                         );
-                                        dht_errors += 1;
-                                        continue;
+                                        self.dht_errors += 1;
+                                        return;
                                     }
                                 };
+
+                                self.authority_to_details
+                                    .entry(authority)
+                                    .and_modify(|entry| entry.extend(addresses.clone()))
+                                    .or_insert_with(|| addresses.iter().cloned().collect());
 
                                 self.peer_details
                                     .entry(peer_id)
@@ -231,23 +292,19 @@ impl AuthorityDiscovery {
 
                                 println!(
                                     "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",
-                                    self.peer_details.len(),
-                                    expected_results,
-                                    dht_errors,
+                                    self.authority_to_details.len(),
+                                    self.authorities.len(),
+                                    self.dht_errors,
                                     authority,
                                     peer_id,
                                     addresses
                                 );
 
-                                // Add more DHT queries.
-                                if self.queries.len() < MAX_QUERIES {
-                                    if let Some(next) = authorities_iter.next() {
-                                        self.query_dht_records(std::iter::once(next));
-                                    };
-                                }
+                                self.remaining_authorities.remove(&authority);
+                                self.advanced_dht_queries();
 
-                                if self.peer_details.len() == expected_results {
-                                    println!("All authorities discovered from DHT: Expected {} Errors {}", expected_results, dht_errors);
+                                if self.peer_details.len() == self.authorities.len() {
+                                    println!("All authorities discovered from DHT: Expected {} Errors {}", self.authorities.len(), self.dht_errors);
 
                                     let discovered = self
                                         .peer_details
@@ -256,7 +313,8 @@ impl AuthorityDiscovery {
                                         .count();
                                     println!(
                                         "Fully discovered at the moment {}/{}",
-                                        discovered, expected_results
+                                        discovered,
+                                        self.authorities.len()
                                     );
 
                                     for peer in self.peer_details.keys() {
@@ -266,7 +324,7 @@ impl AuthorityDiscovery {
                                     }
 
                                     self.query_peer_info();
-                                    finished_records = true;
+                                    self.finished_query = true;
                                 }
                             }
                             _ => (),
@@ -278,7 +336,7 @@ impl AuthorityDiscovery {
                         result: QueryResult::GetClosestPeers(_),
                         ..
                     }) => {
-                        if finished_records {
+                        if self.finished_query {
                             println!(" Discovered closes peers of {:?}", id);
                         }
 
@@ -289,7 +347,7 @@ impl AuthorityDiscovery {
                     BehaviourEvent::PeerInfo(info_event) => {
                         match info_event {
                             PeerInfoEvent::Identified { peer_id, info } => {
-                                if finished_records {
+                                if self.finished_query {
                                     let discovered = self
                                         .peer_details
                                         .keys()
@@ -298,7 +356,9 @@ impl AuthorityDiscovery {
 
                                     println!(
                                         " {}/{} Info event {:?}",
-                                        discovered, expected_results, peer_id
+                                        discovered,
+                                        self.authorities.len(),
+                                        peer_id
                                     );
                                 }
 
@@ -308,9 +368,33 @@ impl AuthorityDiscovery {
                         };
                     }
                     _ => (),
+                }
+            }
+
+            _ => (),
+        }
+    }
+
+    pub async fn discover(&mut self) {
+        self.advanced_dht_queries();
+
+        // Should return immediately.
+        self.interval.tick().await;
+
+        loop {
+            if self.authority_to_details.len() == self.authorities.len() {
+                println!("All authorities discovered from DHT");
+                break;
+            }
+
+            futures::select! {
+                event = self.swarm.select_next_some().fuse() => {
+                    self.handle_swarm(event);
                 },
 
-                _ => (),
+                _ = self.interval.tick().fuse() => {
+                    self.resubmit_remaining_dht_queries();
+                }
             }
         }
     }
@@ -399,28 +483,55 @@ pub async fn discover_authorities(
     // Then, record the addresses of the authorities and the responses
     // from the identify protocol.
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
-    let mut authority_discovery = AuthorityDiscovery::new(swarm);
-    authority_discovery.discover(authorities).await;
+    let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone());
+    authority_discovery.discover().await;
 
-    println!("Finished discovery");
+    println!("Finished discovery\n");
 
-    // Some authorities are not reachable directly, ensure we double check them.
-    let local_key = identity::Keypair::generate_ed25519();
+    for authority in authorities {
+        let Some(details) = authority_discovery.authority_to_details.get(&authority) else {
+            println!("authority={:?} no dht response", authority);
+            continue;
+        };
 
-    let missing_info = authority_discovery
-        .peer_details
-        .iter()
-        .filter(|(peer, _details)| !authority_discovery.peer_info.contains_key(peer))
-        .collect::<Vec<_>>();
+        let Some(addr) = details.iter().next() else {
+            println!("authority={:?} no addresses found", authority);
+            continue;
+        };
 
-    for (peer_id, details) in missing_info {
-        let info = PeerInfo::new(
-            local_key.clone(),
-            details.addresses.iter().cloned().collect(),
-        );
-        let info = info.discover().await;
-        println!("Peer={:?} dial_result={:?}", peer_id, info);
+        let peer_id = get_peer_id(addr).expect("All must have valid peerIDs");
+
+        let info = authority_discovery.peer_info.get(&peer_id).cloned();
+        if let Some(info) = info {
+            println!(
+                "authority={:?} peer_id={:?} version={:?} addresses={:?}",
+                authority, peer_id, info.agent_version, details,
+            );
+        } else {
+            println!(
+                "authority={:?} peer_id={:?} not responding to identify",
+                authority, peer_id
+            );
+        }
     }
+
+    // // Some authorities are not reachable directly, ensure we double check them.
+    // let local_key = identity::Keypair::generate_ed25519();
+
+    // let missing_info = authority_discovery
+    //     .peer_details
+    //     .iter()
+    //     .filter(|(peer, _details)| !authority_discovery.peer_info.contains_key(peer))
+    //     .collect::<Vec<_>>();
+
+    // for (peer_id, details) in missing_info {
+    //     let info = PeerInfo::new(
+    //         local_key.clone(),
+    //         details.addresses.iter().cloned().collect(),
+    //     );
+    //     let info = info.discover().await;
+    //     println!("Peer={:?} dial_result={:?}", peer_id, info);
+    // }
 
     Ok(())
 }
