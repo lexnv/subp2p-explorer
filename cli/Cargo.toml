@@ -43,7 +43,7 @@ trust-dns-resolver = { workspace = true }
 multihash-codetable = { workspace = true, features = ["digest", "serde", "sha2"] }
 jsonrpsee = { workspace = true, features = ["async-client", "client-ws-transport-native-tls"] }
 prost = "0.12"
-
+schnorrkel = "0.11.4"
 
 [build-dependencies]
 prost-build = "0.11"
