@@ -36,6 +36,9 @@ pub struct Authorities {
     /// For example, "/ip4/127.0.0.1/tcp/30333/ws/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp".
     #[clap(long, use_value_delimiter = true, value_parser)]
     bootnodes: Vec<String>,
+    /// The number of seconds the authority discovery process should run for.
+    #[clap(long, short, value_parser = parse_duration)]
+    timeout: std::time::Duration,
 }
 
 /// Send extrinsic on the p2p network.
@@ -171,7 +174,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
-            discover_authorities(opts.url, opts.genesis, opts.bootnodes).await
+            discover_authorities(opts.url, opts.genesis, opts.bootnodes, opts.timeout).await
         }
     }
 }

@@ -24,7 +24,6 @@ use subp2p_explorer::{
     transport::{TransportBuilder, MIB},
     Behaviour, BehaviourEvent,
 };
-use trust_dns_resolver::proto::op::query;
 
 /// Construct a jsonrpc client to communicate with the target node.
 pub async fn client(url: Url) -> Result<Client, Box<dyn std::error::Error>> {
@@ -221,7 +220,11 @@ struct PeerDetails {
 
 impl AuthorityDiscovery {
     /// Constructs a new [`AuthorityDiscovery`].
-    pub fn new(swarm: Swarm<Behaviour>, authorities: Vec<sr25519::PublicKey>) -> Self {
+    pub fn new(
+        swarm: Swarm<Behaviour>,
+        authorities: Vec<sr25519::PublicKey>,
+        timeout: std::time::Duration,
+    ) -> Self {
         AuthorityDiscovery {
             swarm,
             queries: HashMap::with_capacity(1024),
@@ -242,7 +245,7 @@ impl AuthorityDiscovery {
 
             old_log: std::time::Instant::now(),
             interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(60)),
-            interval_exit: tokio::time::interval(std::time::Duration::from_secs(4 * 60)),
+            interval_exit: tokio::time::interval(timeout),
         }
     }
 
@@ -629,6 +632,7 @@ pub async fn discover_authorities(
     url: String,
     genesis: String,
     bootnodes: Vec<String>,
+    timeout: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = Url::parse(&url)?;
 
@@ -639,7 +643,7 @@ pub async fn discover_authorities(
     // Then, record the addresses of the authorities and the responses
     // from the identify protocol.
     let swarm = build_swarm(genesis.clone(), bootnodes)?;
-    let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone());
+    let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
     authority_discovery.discover().await;
     log::info!("Finished discovery\n");
 
