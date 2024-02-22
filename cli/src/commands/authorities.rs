@@ -580,6 +580,7 @@ impl PeerInfo {
 ///
 /// This information is used for the SS58 encoding.
 #[allow(unused)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum VersionRegistry {
     Polkadot,
     Substrate,
@@ -634,6 +635,15 @@ pub async fn discover_authorities(
     bootnodes: Vec<String>,
     timeout: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let version_registry = if url.contains("kusama") {
+        VersionRegistry::Kusama
+    } else if url.contains("polkadot") {
+        VersionRegistry::Polkadot
+    } else {
+        VersionRegistry::Substrate
+    };
+    log::info!("Version registry {:?}", version_registry);
+
     let url = Url::parse(&url)?;
 
     // Extract the authorities from the runtime API.
@@ -653,7 +663,7 @@ pub async fn discover_authorities(
         let Some(details) = authority_discovery.authority_to_details.get(authority) else {
             println!(
                 "authority={:?} - No dht response",
-                to_ss58(authority, VersionRegistry::Polkadot),
+                to_ss58(authority, version_registry),
             );
             continue;
         };
@@ -661,7 +671,7 @@ pub async fn discover_authorities(
         let Some(addr) = details.iter().next() else {
             println!(
                 "authority={:?} - No addresses found in DHT record",
-                to_ss58(authority, VersionRegistry::Polkadot),
+                to_ss58(authority, version_registry),
             );
             continue;
         };
@@ -674,7 +684,7 @@ pub async fn discover_authorities(
 
             println!(
                 "authority={:?} peer_id={:?} addresses={:?} version={:?} ",
-                to_ss58(authority, VersionRegistry::Polkadot),
+                to_ss58(authority, version_registry),
                 peer_id,
                 info.agent_version,
                 details,
@@ -682,7 +692,7 @@ pub async fn discover_authorities(
         } else {
             println!(
                 "authority={:?} peer_id={:?} addresses={:?} - Cannot be reached",
-                to_ss58(authority, VersionRegistry::Polkadot),
+                to_ss58(authority, version_registry),
                 peer_id,
                 details,
             );
