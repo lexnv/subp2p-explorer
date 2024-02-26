@@ -576,27 +576,6 @@ impl PeerInfo {
     }
 }
 
-/// The version registry of the chain.
-///
-/// This information is used for the SS58 encoding.
-#[allow(unused)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum VersionRegistry {
-    Polkadot,
-    Substrate,
-    Kusama,
-}
-
-impl VersionRegistry {
-    pub fn to_version(self) -> u16 {
-        match self {
-            VersionRegistry::Polkadot => 0,
-            VersionRegistry::Substrate => 42,
-            VersionRegistry::Kusama => 2,
-        }
-    }
-}
-
 fn ss58hash(data: &[u8]) -> Vec<u8> {
     use blake2::{Blake2b512, Digest};
     const PREFIX: &[u8] = b"SS58PRE";
@@ -607,9 +586,9 @@ fn ss58hash(data: &[u8]) -> Vec<u8> {
     ctx.finalize().to_vec()
 }
 
-fn to_ss58(key: &sr25519::PublicKey, version: VersionRegistry) -> String {
+fn to_ss58(key: &sr25519::PublicKey, version: u16) -> String {
     // We mask out the upper two bits of the ident - SS58 Prefix currently only supports 14-bits
-    let ident: u16 = version.to_version() & 0b0011_1111_1111_1111;
+    let ident: u16 = version & 0b0011_1111_1111_1111;
     let mut v = match ident {
         0..=63 => vec![ident as u8],
         64..=16_383 => {
@@ -634,15 +613,18 @@ pub async fn discover_authorities(
     genesis: String,
     bootnodes: Vec<String>,
     timeout: std::time::Duration,
+    address_format: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let version_registry = if url.contains("kusama") {
-        VersionRegistry::Kusama
-    } else if url.contains("polkadot") {
-        VersionRegistry::Polkadot
-    } else {
-        VersionRegistry::Substrate
-    };
-    log::info!("Version registry {:?}", version_registry);
+    let format_registry =
+        ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
+            .map_err(|err| format!("Cannot parse the provided address format: {:?}", err))?;
+    let version: ss58_registry::Ss58AddressFormat = format_registry.into();
+    let version = version.prefix();
+    log::info!(
+        "Address format {:?} with version prefix {:?}",
+        format_registry,
+        version
+    );
 
     let url = Url::parse(&url)?;
 
@@ -663,7 +645,7 @@ pub async fn discover_authorities(
         let Some(details) = authority_discovery.authority_to_details.get(authority) else {
             println!(
                 "authority={:?} - No dht response",
-                to_ss58(authority, version_registry),
+                to_ss58(authority, version),
             );
             continue;
         };
@@ -671,7 +653,7 @@ pub async fn discover_authorities(
         let Some(addr) = details.iter().next() else {
             println!(
                 "authority={:?} - No addresses found in DHT record",
-                to_ss58(authority, version_registry),
+                to_ss58(authority, version),
             );
             continue;
         };
@@ -684,7 +666,7 @@ pub async fn discover_authorities(
 
             println!(
                 "authority={:?} peer_id={:?} addresses={:?} version={:?} ",
-                to_ss58(authority, version_registry),
+                to_ss58(authority, version),
                 peer_id,
                 info.agent_version,
                 details,
@@ -692,7 +674,7 @@ pub async fn discover_authorities(
         } else {
             println!(
                 "authority={:?} peer_id={:?} addresses={:?} - Cannot be reached",
-                to_ss58(authority, version_registry),
+                to_ss58(authority, version),
                 peer_id,
                 details,
             );

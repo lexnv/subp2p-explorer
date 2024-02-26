@@ -39,6 +39,15 @@ pub struct Authorities {
     /// The number of seconds the authority discovery process should run for.
     #[clap(long, short, value_parser = parse_duration)]
     timeout: std::time::Duration,
+    /// The address format name of the chain.
+    /// Used to display the SS58 address of the authorities.
+    ///
+    /// For example:
+    /// - "polkadot" for Polkadot
+    /// - "substrate" for Substrate
+    /// - "kusama" for Kusama
+    #[clap(long, short)]
+    address_format: String,
 }
 
 /// Send extrinsic on the p2p network.
@@ -174,7 +183,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
-            discover_authorities(opts.url, opts.genesis, opts.bootnodes, opts.timeout).await
+            discover_authorities(
+                opts.url,
+                opts.genesis,
+                opts.bootnodes,
+                opts.timeout,
+                opts.address_format,
+            )
+            .await
         }
     }
 }
