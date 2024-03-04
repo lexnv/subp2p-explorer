@@ -614,6 +614,7 @@ pub async fn discover_authorities(
     bootnodes: Vec<String>,
     timeout: std::time::Duration,
     address_format: String,
+    raw_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let format_registry =
         ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
@@ -688,6 +689,14 @@ pub async fn discover_authorities(
     );
 
     println!(" Discovered peers {}", authority_discovery.peer_info.len());
+
+    if raw_output {
+        println!("\n Raw output of the discovered peers:");
+
+        for (peer_id, info) in &authority_discovery.peer_info {
+            println!("peer_id={:?} info={:?}", peer_id, info);
+        }
+    }
 
     Ok(())
 }

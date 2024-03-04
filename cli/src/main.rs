@@ -48,6 +48,9 @@ pub struct Authorities {
     /// - "kusama" for Kusama
     #[clap(long, short)]
     address_format: String,
+    /// Print the raw identity list of discovered peers.
+    #[clap(long, short)]
+    raw_output: bool,
 }
 
 /// Send extrinsic on the p2p network.
@@ -189,6 +192,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.bootnodes,
                 opts.timeout,
                 opts.address_format,
+                opts.raw_output,
             )
             .await
         }
