@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod notifications;
 pub mod peer_behavior;
 pub mod transport;
+pub mod util;
 
 /// Network behavior for subtrate based chains.
 #[derive(NetworkBehaviour)]
