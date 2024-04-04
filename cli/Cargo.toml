@@ -42,8 +42,5 @@ maxminddb = { workspace = true }
 trust-dns-resolver = { workspace = true }
 multihash-codetable = { workspace = true, features = ["digest", "serde", "sha2"] }
 jsonrpsee = { workspace = true, features = ["async-client", "client-ws-transport-native-tls"] }
-prost = "0.12"
 ss58-registry = { version = "1.34.0", default-features = false }
 
-[build-dependencies]
-prost-build = "0.11"

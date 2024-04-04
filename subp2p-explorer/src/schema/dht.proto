@@ -1,5 +1,6 @@
 syntax = "proto3";
 
+// Protocol buffers for Authority Discovery utilities
 package authority_discovery_v2;
 
 // First we need to serialize the addresses in order to be able to sign them.
