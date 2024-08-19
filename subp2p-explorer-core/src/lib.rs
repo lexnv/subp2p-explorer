@@ -63,11 +63,17 @@ pub enum NetworkEvent {
 }
 
 pub struct Litep2pBackend {
-    inner: litep2p::Litep2p,
-
+    tx: tokio::sync::mpsc::Sender<InnerCommand>,
     kad_handle: KademliaHandle,
     ping_stream: Box<dyn Stream<Item = PingEvent> + Send + Unpin>,
     identify_stream: Box<dyn Stream<Item = IdentifyEvent> + Send + Unpin>,
+}
+
+enum InnerCommand {
+    AddKnownAddress {
+        peer_id: PeerId,
+        address: Vec<Multiaddr>,
+    },
 }
 
 impl Litep2pBackend {
@@ -94,14 +100,59 @@ impl Litep2pBackend {
             .with_libp2p_identify(identify_config)
             .build();
 
-        let litep2p = Litep2p::new(litep2p_config).unwrap();
+        let mut litep2p = Litep2p::new(litep2p_config).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        match event {
+                            Some(InnerCommand::AddKnownAddress { peer_id, address }) => {
+                                litep2p.add_known_address(peer_id.into(), address.into_iter().map(Into::into));
+                            },
+                            _ => return,
+                        }
+                    },
+
+                    _ = litep2p.next_event() => {},
+                }
+            }
+        });
 
         Litep2pBackend {
-            inner: litep2p,
+            tx,
             kad_handle,
             ping_stream: ping_event_stream,
             identify_stream: identify_event_stream,
         }
+    }
+
+    pub async fn find_node(&mut self, peer: PeerId) -> QueryId {
+        QueryId(self.kad_handle.find_node(peer.into()).await.0)
+    }
+
+    pub async fn add_known_peer(
+        &mut self,
+        peer_id: PeerId,
+        address: impl Iterator<Item = Multiaddr>,
+    ) {
+        let address = address.collect::<Vec<_>>();
+        let _ = self
+            .tx
+            .send(InnerCommand::AddKnownAddress {
+                peer_id,
+                address: address.clone(),
+            })
+            .await
+            .expect("Backend task closed; this should never happen");
+
+        self.kad_handle
+            .add_known_peer(
+                peer_id.into(),
+                address.into_iter().map(Into::into).collect(),
+            )
+            .await;
     }
 }
 
