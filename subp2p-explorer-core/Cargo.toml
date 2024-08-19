@@ -1,5 +1,5 @@
 [package]
-name = "subp2p-explorer"
+name = "subp2p-explorer-core"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 license.workspace = true
-description = "Submit extrinsics and explore substrate p2p network"
+description = "Explore substrate p2p network"
 keywords = ["peer-to-peer", "libp2p", "networking"]
 categories = ["network-programming", "asynchronous"]
 
@@ -37,7 +37,10 @@ blake2 = "0.10.4"
 multihash-codetable = { workspace = true, features = ["digest", "serde", "sha2"] }
 bs58 = { version = "0.5.0", features = ["alloc"] }
 prost = "0.12"
-multiaddr = { workspace = true }
+litep2p = { workspace = true }
+multiaddr ={ workspace = true }
+multihash = { workspace = true, default-features = false }
+libp2p-identity = { features = ["ed25519", "peerid", "rand"], workspace = true }
 
 [build-dependencies]
 prost-build = "0.11"
