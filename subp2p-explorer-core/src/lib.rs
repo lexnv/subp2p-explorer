@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use types::{multiaddr::Multiaddr, peer_id::PeerId};
 
+pub mod libp2p;
 pub mod litep2p;
 
 pub struct NetworkBackend {}

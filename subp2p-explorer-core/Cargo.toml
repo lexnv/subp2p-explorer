@@ -41,6 +41,9 @@ litep2p = { workspace = true }
 multiaddr ={ workspace = true }
 multihash = { workspace = true, default-features = false }
 libp2p-identity = { features = ["ed25519", "peerid", "rand"], workspace = true }
+libp2p-tls = { workspace = true }
+libp2p-noise = { workspace = true }
+libp2p-yamux = { workspace = true }
 
 [build-dependencies]
 prost-build = "0.11"

@@ -60,7 +60,7 @@ impl Locator {
 
         Some(Location {
             city: city.into_string(),
-            accuracy_radius: location.clone().map(|loc| loc.accuracy_radius).flatten(),
+            accuracy_radius: location.clone().map(|loc: maxminddb::geoip2::city::Location| loc.accuracy_radius).flatten(),
             latitude: location.clone().map(|loc| loc.latitude).flatten(),
             longitude: location.clone().map(|loc| loc.longitude).flatten(),
             metro_code: location.clone().map(|loc| loc.metro_code).flatten(),
