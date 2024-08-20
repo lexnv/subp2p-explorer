@@ -1,13 +1,11 @@
 pub mod types;
 
+use async_trait::async_trait;
 use std::collections::HashSet;
-
 use types::{multiaddr::Multiaddr, peer_id::PeerId};
 
 pub mod libp2p;
 pub mod litep2p;
-
-pub struct NetworkBackend {}
 
 pub enum DhtEvent {}
 
@@ -50,4 +48,11 @@ pub enum NetworkEvent {
         /// Found nodes and their addresses.
         peers: Vec<(PeerId, Vec<Multiaddr>)>,
     },
+}
+
+#[async_trait]
+pub trait NetworkBackend {
+    async fn find_node(&mut self, peer: PeerId) -> QueryId;
+
+    async fn add_known_peer(&mut self, peer_id: PeerId, address: Vec<Multiaddr>);
 }

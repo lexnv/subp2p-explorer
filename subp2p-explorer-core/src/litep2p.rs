@@ -5,6 +5,7 @@ use crate::{
     types::{multiaddr::Multiaddr, peer_id::PeerId},
     QueryId,
 };
+use async_trait::async_trait;
 
 use litep2p::{
     config::ConfigBuilder,
@@ -83,17 +84,15 @@ impl Litep2pBackend {
             identify_stream: identify_event_stream,
         }
     }
+}
 
-    pub async fn find_node(&mut self, peer: PeerId) -> QueryId {
+#[async_trait]
+impl crate::NetworkBackend for Litep2pBackend {
+    async fn find_node(&mut self, peer: PeerId) -> QueryId {
         QueryId(self.kad_handle.find_node(peer.into()).await.0)
     }
 
-    pub async fn add_known_peer(
-        &mut self,
-        peer_id: PeerId,
-        address: impl Iterator<Item = Multiaddr>,
-    ) {
-        let address = address.collect::<Vec<_>>();
+    async fn add_known_peer(&mut self, peer_id: PeerId, address: Vec<Multiaddr>) {
         let _ = self
             .tx
             .send(InnerCommand::AddKnownAddress {

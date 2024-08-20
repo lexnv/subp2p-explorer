@@ -1,5 +1,6 @@
 use futures::{Stream, StreamExt};
 
+use async_trait::async_trait;
 use libp2p::{
     identify::{Behaviour as Identify, Config as IdentifyConfig, Event as IdentifyEvent},
     kad::{
@@ -150,8 +151,11 @@ impl Libp2pBackend {
             peer_addresses: HashMap::new(),
         }
     }
+}
 
-    pub async fn find_node(&mut self, peer: PeerId) -> QueryId {
+#[async_trait]
+impl crate::NetworkBackend for Libp2pBackend {
+    async fn find_node(&mut self, peer: PeerId) -> QueryId {
         let peer_id: libp2p::PeerId = peer.into();
 
         let query = self
@@ -168,11 +172,7 @@ impl Libp2pBackend {
         QueryId(query_id)
     }
 
-    pub async fn add_known_peer(
-        &mut self,
-        peer_id: PeerId,
-        address: impl Iterator<Item = Multiaddr>,
-    ) {
+    async fn add_known_peer(&mut self, peer_id: PeerId, address: Vec<Multiaddr>) {
         let peer_id: libp2p::PeerId = peer_id.into();
         address.into_iter().map(Into::into).for_each(|address| {
             self.inner
@@ -192,10 +192,13 @@ impl Stream for Libp2pBackend {
     ) -> Poll<Option<Self::Item>> {
         match self.inner.poll_next_unpin(cx) {
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(event)) => match event {
-                libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
-                    BehaviourEvent::Identify(IdentifyEvent::Received { peer_id, info, .. }) => {
-                        Poll::Ready(Some(NetworkEvent::PeerIdentified {
+            Poll::Ready(Some(event)) => {
+                log::info!("libp2p event {:?}", event);
+                match event {
+                    libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
+                        BehaviourEvent::Identify(IdentifyEvent::Received {
+                            peer_id, info, ..
+                        }) => Poll::Ready(Some(NetworkEvent::PeerIdentified {
                             peer: peer_id.into(),
                             protocol_version: Some(info.protocol_version),
                             user_agent: Some(info.agent_version),
@@ -210,70 +213,72 @@ impl Stream for Libp2pBackend {
                                 .into_iter()
                                 .map(Into::into)
                                 .collect(),
-                        }))
-                    }
-                    BehaviourEvent::Discovery(event) => match event {
-                        KademliaEvent::OutboundQueryProgressed {
-                            id,
-                            result: QueryResult::GetClosestPeers(result),
-                            ..
-                        } => {
-                            let (key, peers) = match result {
-                                Ok(res) => (res.key, res.peers),
-                                Err(GetClosestPeersError::Timeout { key, peers }) => (key, peers),
-                            };
+                        })),
+                        BehaviourEvent::Discovery(event) => match event {
+                            KademliaEvent::OutboundQueryProgressed {
+                                id,
+                                result: QueryResult::GetClosestPeers(result),
+                                ..
+                            } => {
+                                let (key, peers) = match result {
+                                    Ok(res) => (res.key, res.peers),
+                                    Err(GetClosestPeersError::Timeout { key, peers }) => {
+                                        (key, peers)
+                                    }
+                                };
 
-                            // Get the subp2p query ID.
-                            let query_id = self.query_translate.remove(&id).unwrap();
+                                // Get the subp2p query ID.
+                                let query_id = self.query_translate.remove(&id).unwrap();
 
-                            Poll::Ready(Some(NetworkEvent::FindNode {
-                                query_id,
-                                target: PeerId::from_bytes(key.as_ref()).unwrap(),
-                                peers: peers
-                                    .into_iter()
-                                    .map(|peer_id| {
-                                        let addresses = self
-                                            .peer_addresses
-                                            .get(&peer_id)
-                                            .map(Clone::clone)
-                                            .unwrap_or_default()
-                                            .into_iter()
-                                            .map(Into::into)
-                                            .collect();
-                                        (peer_id.into(), addresses)
-                                    })
-                                    .collect(),
-                            }))
-                        }
+                                Poll::Ready(Some(NetworkEvent::FindNode {
+                                    query_id,
+                                    target: PeerId::from_bytes(key.as_ref()).unwrap(),
+                                    peers: peers
+                                        .into_iter()
+                                        .map(|peer_id| {
+                                            let addresses = self
+                                                .peer_addresses
+                                                .get(&peer_id)
+                                                .map(Clone::clone)
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect();
+                                            (peer_id.into(), addresses)
+                                        })
+                                        .collect(),
+                                }))
+                            }
 
-                        // Collect addresses during discovery.
-                        KademliaEvent::RoutablePeer { peer, address }
-                        | KademliaEvent::PendingRoutablePeer { peer, address } => {
-                            self.peer_addresses
-                                .entry(peer)
-                                .or_insert_with(Vec::new)
-                                .push(address);
+                            // Collect addresses during discovery.
+                            KademliaEvent::RoutablePeer { peer, address }
+                            | KademliaEvent::PendingRoutablePeer { peer, address } => {
+                                self.peer_addresses
+                                    .entry(peer)
+                                    .or_insert_with(Vec::new)
+                                    .push(address);
 
-                            Poll::Pending
-                        }
-                        KademliaEvent::RoutingUpdated {
-                            peer, addresses, ..
-                        } => {
-                            self.peer_addresses
-                                .entry(peer)
-                                .or_insert_with(Vec::new)
-                                .extend(addresses.into_vec());
+                                Poll::Pending
+                            }
+                            KademliaEvent::RoutingUpdated {
+                                peer, addresses, ..
+                            } => {
+                                self.peer_addresses
+                                    .entry(peer)
+                                    .or_insert_with(Vec::new)
+                                    .extend(addresses.into_vec());
 
-                            Poll::Pending
-                        }
+                                Poll::Pending
+                            }
+
+                            _ => Poll::Pending,
+                        },
 
                         _ => Poll::Pending,
                     },
-
                     _ => Poll::Pending,
-                },
-                _ => Poll::Pending,
-            },
+                }
+            }
             _ => Poll::Pending,
         }
     }
