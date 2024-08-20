@@ -1,7 +1,10 @@
 use futures::{Stream, StreamExt};
 use std::task::Poll;
 
-use crate::types::{multiaddr::Multiaddr, peer_id::PeerId};
+use crate::{
+    types::{multiaddr::Multiaddr, peer_id::PeerId},
+    QueryId,
+};
 
 use litep2p::{
     config::ConfigBuilder,
