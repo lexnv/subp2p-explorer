@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use libp2p::{
     identify::{Behaviour as Identify, Config as IdentifyConfig, Event as IdentifyEvent},
     kad::{
-        store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig,
-        Event as KademliaEvent, GetClosestPeersError, QueryResult,
+        store::MemoryStore, Behaviour as Kademlia, Event as KademliaEvent, GetClosestPeersError,
+        QueryResult,
     },
     ping::Behaviour as Ping,
-    swarm::{NetworkBehaviour, SwarmBuilder},
+    swarm::NetworkBehaviour,
     StreamProtocol,
 };
 
@@ -19,8 +19,11 @@ use crate::{
     NetworkEvent, QueryId,
 };
 
+type SwarmEvent = libp2p::swarm::SwarmEvent<BehaviourEvent>;
+
 pub struct Libp2pBackend {
-    inner: libp2p::Swarm<Behaviour>,
+    rx: tokio::sync::mpsc::Receiver<SwarmEvent>,
+    command_tx: tokio::sync::mpsc::Sender<InnerCommand>,
 
     query_translate: HashMap<libp2p::kad::QueryId, QueryId>,
     peer_addresses: HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>>,
@@ -38,69 +41,25 @@ pub struct Behaviour {
     discovery: Kademlia<MemoryStore>,
 }
 
-const YAMUX_WINDOW_SIZE: u32 = 256 * 1024;
-const YAMUX_MAXIMUM_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+// const YAMUX_WINDOW_SIZE: u32 = 256 * 1024;
+// const YAMUX_MAXIMUM_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
 impl Libp2pBackend {
-    fn transport(
-        keypair: libp2p::identity::Keypair,
-    ) -> libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>
-    {
-        use libp2p::Transport;
-
-        // The main transport is DNS(TCP).
-        let tcp_config = libp2p::tcp::Config::new().nodelay(true);
-        let tcp_trans = libp2p::tcp::tokio::Transport::new(tcp_config.clone());
-        let dns = libp2p::dns::TokioDnsConfig::system(tcp_trans).expect("Can construct DNS; qed");
-
-        // Support for WS and WSS.
-        let tcp_trans = libp2p::tcp::tokio::Transport::new(tcp_config);
-        let dns_for_wss =
-            libp2p::dns::TokioDnsConfig::system(tcp_trans).expect("Valid config provided; qed");
-
-        let transport = libp2p::websocket::WsConfig::new(dns_for_wss).or_transport(dns);
-
-        let authentication_config =
-            libp2p::noise::Config::new(&keypair).expect("Can create noise config; qed");
-
-        let multiplexing_config = {
-            let mut yamux_config = libp2p::yamux::Config::default();
-
-            // Enable proper flow-control: window updates are only sent when
-            // buffered data has been consumed.
-            yamux_config.set_window_update_mode(libp2p::yamux::WindowUpdateMode::on_read());
-            yamux_config.set_max_buffer_size(YAMUX_MAXIMUM_BUFFER_SIZE);
-            yamux_config.set_receive_window_size(YAMUX_WINDOW_SIZE);
-
-            yamux_config
-        };
-
-        transport
-            .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-            .authenticate(authentication_config)
-            .multiplex(multiplexing_config)
-            .timeout(std::time::Duration::from_secs(20))
-            .boxed()
-    }
-
-    pub fn new(genesis: String) -> Self {
+    pub async fn new(genesis: String) -> Self {
         let local_key = libp2p::identity::Keypair::generate_ed25519();
         let local_peer_id = libp2p::PeerId::from(local_key.public());
-
-        let transport = Self::transport(local_key.clone());
 
         let genesis = genesis.trim_start_matches("0x");
         let kad_protocol = format!("/{}/kad", genesis);
 
-        let mut discovery = KademliaConfig::default();
-        discovery.set_max_packet_size(8192);
-        discovery.set_record_ttl(None);
-        discovery.set_provider_record_ttl(None);
-        discovery.set_query_timeout(std::time::Duration::from_secs(60));
-        discovery.set_protocol_names(vec![StreamProtocol::try_from_owned(kad_protocol).unwrap()]);
-
+        let mut disc_config =
+            libp2p::kad::Config::new(StreamProtocol::try_from_owned(kad_protocol).unwrap());
+        disc_config.set_max_packet_size(8192);
+        disc_config.set_record_ttl(None);
+        disc_config.set_provider_record_ttl(None);
+        disc_config.set_query_timeout(std::time::Duration::from_secs(10));
         let store = MemoryStore::new(local_peer_id.clone());
-        let discovery = Kademlia::with_config(local_peer_id.clone(), store, discovery);
+        let discovery = Kademlia::with_config(local_peer_id.clone(), store, disc_config);
 
         let identify_config = IdentifyConfig::new("subp2p-explorer-0.1".into(), local_key.public())
             .with_cache_size(0);
@@ -114,37 +73,76 @@ impl Libp2pBackend {
             discovery,
         };
 
-        // TODO: The new API example is broken.
-        // use libp2p::core::muxing::StreamMuxerBox;
-        // use libp2p::core::transport::dummy::DummyTransport;
-        // use libp2p::identity::PeerId;
-        // use libp2p::{swarm::NetworkBehaviour, SwarmBuilder};
-        // use std::error::Error;
-        // libp2p::SwarmBuilder::with_existing_identity(local_key)
-        //     .with_tokio()
-        //     .with_tcp(
-        //         TcpConfig::new().nodelay(true),
-        //         (libp2p_tls::Config::new, libp2p_noise::Config::new),
-        //         libp2p_yamux::Config::default,
-        //     )
-        //     .with_dns()
-        //     .expect("Can construct DNS; qed")
-        //     .with_websocket(
-        //         (libp2p_tls::Config::new, libp2p_noise::Config::new),
-        //         libp2p_yamux::Config::default,
-        //     )
-        //     .await
-        //     .expect("Can construct websocket; qed")
-        //     .with_behaviour(|_key, _relay| behavior)
-        //     .build();
+        use libp2p::tcp::Config as TcpConfig;
+
+        let tcp_config = TcpConfig::new().nodelay(true);
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp_config,
+                libp2p_noise::Config::new,
+                libp2p_yamux::Config::default,
+            )
+            .expect("Can construct TCP; qed")
+            .with_dns()
+            .expect("Can construct DNS; qed")
+            .with_websocket(libp2p_noise::Config::new, libp2p_yamux::Config::default)
+            .await
+            .expect("Can construct websocket; qed")
+            .with_behaviour(|_key| behavior)
+            .expect("Can construct behaviour; qed")
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1024 * 1024);
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(512);
+
+        tokio::spawn(async move {
+            fn handle_cmd(swarm: &mut libp2p::Swarm<Behaviour>, cmd: InnerCommand) {
+                log::trace!("[background] command {:?}", cmd);
+
+                match cmd {
+                    InnerCommand::AddKnownAddress { peer_id, address } => {
+                        swarm
+                            .behaviour_mut()
+                            .discovery
+                            .add_address(&peer_id, address);
+                    }
+                    InnerCommand::FindNode { peer_id, query_id } => {
+                        let id = swarm.behaviour_mut().discovery.get_closest_peers(peer_id);
+                        query_id.send(id).expect("Query ID should be received");
+                    }
+                }
+            }
+
+            async fn handle_swarm_event(
+                tx: &tokio::sync::mpsc::Sender<SwarmEvent>,
+                event: SwarmEvent,
+            ) -> bool {
+                log::trace!("[background] swarm event {:?}", event);
+                if tx.send(event).await.is_err() {
+                    return true;
+                }
+                false
+            }
+
+            loop {
+                tokio::select! {
+                    event = command_rx.recv() => {
+                        handle_cmd(&mut swarm, event.unwrap());
+                    },
+
+                    event = swarm.select_next_some() => {
+                        if handle_swarm_event(&tx, event).await {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
 
         Self {
-            inner: libp2p::swarm::SwarmBuilder::with_tokio_executor(
-                transport,
-                behavior,
-                local_peer_id,
-            )
-            .build(),
+            rx,
+            command_tx,
 
             query_translate: HashMap::new(),
             next_query_id: AtomicUsize::new(0),
@@ -153,16 +151,36 @@ impl Libp2pBackend {
     }
 }
 
+#[derive(Debug)]
+enum InnerCommand {
+    AddKnownAddress {
+        peer_id: libp2p::PeerId,
+        address: libp2p::Multiaddr,
+    },
+    FindNode {
+        peer_id: libp2p::PeerId,
+        query_id: tokio::sync::oneshot::Sender<libp2p::kad::QueryId>,
+    },
+}
+
 #[async_trait]
 impl crate::NetworkBackend for Libp2pBackend {
     async fn find_node(&mut self, peer: PeerId) -> QueryId {
         let peer_id: libp2p::PeerId = peer.into();
 
-        let query = self
-            .inner
-            .behaviour_mut()
-            .discovery
-            .get_closest_peers(peer_id);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let find_node = InnerCommand::FindNode {
+            peer_id,
+            query_id: tx,
+        };
+
+        self.command_tx
+            .send(find_node)
+            .await
+            .expect("Backend task closed; this should never happen");
+
+        let query = rx.await.expect("Query ID should be received");
+        log::info!("find_node {:?}", query);
 
         let query_id = self
             .next_query_id
@@ -173,13 +191,21 @@ impl crate::NetworkBackend for Libp2pBackend {
     }
 
     async fn add_known_peer(&mut self, peer_id: PeerId, address: Vec<Multiaddr>) {
+        log::info!("add_known_peer {:?} at {:?}", peer_id, address);
         let peer_id: libp2p::PeerId = peer_id.into();
-        address.into_iter().map(Into::into).for_each(|address| {
-            self.inner
-                .behaviour_mut()
-                .discovery
-                .add_address(&peer_id, address);
-        })
+
+        for addr in address {
+            let addr: libp2p::Multiaddr = addr.into();
+            let command = InnerCommand::AddKnownAddress {
+                peer_id,
+                address: addr,
+            };
+
+            self.command_tx
+                .send(command)
+                .await
+                .expect("Backend task closed; this should never happen");
+        }
     }
 }
 
@@ -187,99 +213,93 @@ impl Stream for Libp2pBackend {
     type Item = NetworkEvent;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context,
     ) -> Poll<Option<Self::Item>> {
-        match self.inner.poll_next_unpin(cx) {
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(event)) => {
-                log::info!("libp2p event {:?}", event);
-                match event {
-                    libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
-                        BehaviourEvent::Identify(IdentifyEvent::Received {
-                            peer_id, info, ..
-                        }) => Poll::Ready(Some(NetworkEvent::PeerIdentified {
-                            peer: peer_id.into(),
-                            protocol_version: Some(info.protocol_version),
-                            user_agent: Some(info.agent_version),
-                            supported_protocols: info
-                                .protocols
-                                .into_iter()
-                                .map(|p| p.to_string())
-                                .collect(),
-                            observed_address: info.observed_addr.into(),
-                            listen_addresses: info
-                                .listen_addrs
-                                .into_iter()
-                                .map(Into::into)
-                                .collect(),
-                        })),
-                        BehaviourEvent::Discovery(event) => match event {
-                            KademliaEvent::OutboundQueryProgressed {
-                                id,
-                                result: QueryResult::GetClosestPeers(result),
-                                ..
-                            } => {
-                                let (key, peers) = match result {
-                                    Ok(res) => (res.key, res.peers),
-                                    Err(GetClosestPeersError::Timeout { key, peers }) => {
-                                        (key, peers)
-                                    }
-                                };
+        let this = std::pin::Pin::into_inner(self);
 
-                                // Get the subp2p query ID.
-                                let query_id = self.query_translate.remove(&id).unwrap();
+        let result = this.rx.poll_recv(cx);
+        let event = match result {
+            Poll::Ready(Some(event)) => event,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        };
 
-                                Poll::Ready(Some(NetworkEvent::FindNode {
-                                    query_id,
-                                    target: PeerId::from_bytes(key.as_ref()).unwrap(),
-                                    peers: peers
-                                        .into_iter()
-                                        .map(|peer_id| {
-                                            let addresses = self
-                                                .peer_addresses
-                                                .get(&peer_id)
-                                                .map(Clone::clone)
-                                                .unwrap_or_default()
-                                                .into_iter()
-                                                .map(Into::into)
-                                                .collect();
-                                            (peer_id.into(), addresses)
-                                        })
-                                        .collect(),
-                                }))
-                            }
+        log::trace!("libp2p event {:?}", event);
 
-                            // Collect addresses during discovery.
-                            KademliaEvent::RoutablePeer { peer, address }
-                            | KademliaEvent::PendingRoutablePeer { peer, address } => {
-                                self.peer_addresses
-                                    .entry(peer)
-                                    .or_insert_with(Vec::new)
-                                    .push(address);
-
-                                Poll::Pending
-                            }
-                            KademliaEvent::RoutingUpdated {
-                                peer, addresses, ..
-                            } => {
-                                self.peer_addresses
-                                    .entry(peer)
-                                    .or_insert_with(Vec::new)
-                                    .extend(addresses.into_vec());
-
-                                Poll::Pending
-                            }
-
-                            _ => Poll::Pending,
-                        },
-
-                        _ => Poll::Pending,
-                    },
-                    _ => Poll::Pending,
+        match event {
+            libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
+                BehaviourEvent::Identify(IdentifyEvent::Received { peer_id, info, .. }) => {
+                    return Poll::Ready(Some(NetworkEvent::PeerIdentified {
+                        peer: peer_id.into(),
+                        protocol_version: Some(info.protocol_version),
+                        user_agent: Some(info.agent_version),
+                        supported_protocols: info
+                            .protocols
+                            .into_iter()
+                            .map(|p| p.to_string())
+                            .collect(),
+                        observed_address: info.observed_addr.into(),
+                        listen_addresses: info.listen_addrs.into_iter().map(Into::into).collect(),
+                    }));
                 }
-            }
-            _ => Poll::Pending,
-        }
+                BehaviourEvent::Discovery(event) => match event {
+                    KademliaEvent::OutboundQueryProgressed {
+                        id,
+                        result: QueryResult::GetClosestPeers(result),
+                        ..
+                    } => {
+                        let (key, peers) = match result {
+                            Ok(res) => (res.key, res.peers),
+                            Err(GetClosestPeersError::Timeout { key, peers }) => (key, peers),
+                        };
+
+                        // Get the subp2p query ID.
+                        let query_id = this.query_translate.remove(&id).unwrap();
+
+                        return Poll::Ready(Some(NetworkEvent::FindNode {
+                            query_id,
+                            target: PeerId::from_bytes(key.as_ref()).unwrap(),
+                            peers: peers
+                                .into_iter()
+                                .map(|peer_id| {
+                                    (
+                                        peer_id.peer_id.into(),
+                                        peer_id.addrs.into_iter().map(Into::into).collect(),
+                                    )
+                                })
+                                .collect(),
+                        }));
+                    }
+
+                    // Collect addresses during discovery.
+                    KademliaEvent::RoutablePeer { peer, address }
+                    | KademliaEvent::PendingRoutablePeer { peer, address } => {
+                        this.peer_addresses
+                            .entry(peer)
+                            .or_insert_with(Vec::new)
+                            .push(address);
+                    }
+                    KademliaEvent::RoutingUpdated {
+                        peer, addresses, ..
+                    } => {
+                        this.peer_addresses
+                            .entry(peer)
+                            .or_insert_with(Vec::new)
+                            .extend(addresses.into_vec());
+                    }
+                    _ => (),
+                },
+                _ => (),
+            },
+            _ => (),
+        };
+
+        // Since we are only interested in some events from the backend,
+        // we need to wake up the task again to poll for more events.
+        // Otherwise, we would be stuck in the pending state since no external
+        // event will ever call cx.waker().wake_by_ref() again.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }

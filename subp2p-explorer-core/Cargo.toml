@@ -18,7 +18,6 @@ env_logger = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 futures = { workspace = true }
-libp2p = { workspace = true, features = ["dns", "identify", "kad", "macros", "mdns", "noise", "ping", "tcp",  "tokio", "yamux", "websocket", "request-response"] }
 rand = { workspace = true }
 fnv = { workspace = true }
 log = { workspace = true }
@@ -40,6 +39,8 @@ prost = "0.12"
 litep2p = { workspace = true }
 multiaddr ={ workspace = true }
 multihash = { workspace = true, default-features = false }
+
+libp2p = { version = "0.54", features = ["dns", "identify", "kad", "macros", "mdns", "noise", "ping", "tcp",  "tokio", "yamux", "websocket", "request-response"] }
 libp2p-identity = { features = ["ed25519", "peerid", "rand"], workspace = true }
 libp2p-tls = { workspace = true }
 libp2p-noise = { workspace = true }
