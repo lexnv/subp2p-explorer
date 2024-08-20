@@ -11,7 +11,7 @@ use subp2p_explorer_core::{
 use crate::DiscoverBackendsNetworkOpts;
 
 /// This is the main driver of the Kademlia discovery process.
-pub async fn inner_discovery<Backend>(
+pub async fn discovery<Backend>(
     mut backend: Backend,
     bootnodes: Vec<(PeerId, Multiaddr)>,
     num_peers: usize,
@@ -91,17 +91,16 @@ pub async fn discovery_backends(opts: DiscoverBackendsNetworkOpts) -> Result<(),
         .collect();
 
     let now = std::time::Instant::now();
-
     match opts.backend_type {
         crate::BackendType::Litep2p => {
             let backend = subp2p_explorer_core::litep2p::Litep2pBackend::new(opts.genesis);
 
-            inner_discovery(backend, bootnodes, opts.num_peers).await?;
+            discovery(backend, bootnodes, opts.num_peers).await?;
         }
         crate::BackendType::Libp2p => {
             let backend = subp2p_explorer_core::libp2p::Libp2pBackend::new(opts.genesis).await;
 
-            inner_discovery(backend, bootnodes, opts.num_peers).await?;
+            discovery(backend, bootnodes, opts.num_peers).await?;
         }
     };
 

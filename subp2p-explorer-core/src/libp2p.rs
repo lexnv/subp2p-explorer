@@ -97,7 +97,11 @@ impl Libp2pBackend {
         let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(512);
 
         tokio::spawn(async move {
-            fn handle_cmd(swarm: &mut libp2p::Swarm<Behaviour>, cmd: InnerCommand) {
+            fn handle_cmd(swarm: &mut libp2p::Swarm<Behaviour>, cmd: Option<InnerCommand>) -> bool {
+                let Some(cmd) = cmd else {
+                    return true;
+                };
+
                 log::trace!("[background] command {:?}", cmd);
 
                 match cmd {
@@ -111,7 +115,9 @@ impl Libp2pBackend {
                         let id = swarm.behaviour_mut().discovery.get_closest_peers(peer_id);
                         query_id.send(id).expect("Query ID should be received");
                     }
-                }
+                };
+
+                false
             }
 
             async fn handle_swarm_event(
@@ -128,9 +134,10 @@ impl Libp2pBackend {
             loop {
                 tokio::select! {
                     event = command_rx.recv() => {
-                        handle_cmd(&mut swarm, event.unwrap());
+                        if handle_cmd(&mut swarm, event) {
+                            break;
+                        }
                     },
-
                     event = swarm.select_next_some() => {
                         if handle_swarm_event(&tx, event).await {
                             break;
