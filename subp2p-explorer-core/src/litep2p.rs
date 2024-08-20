@@ -109,6 +109,13 @@ impl crate::NetworkBackend for Litep2pBackend {
             )
             .await;
     }
+
+    fn poll_next_event(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<Option<NetworkEvent>> {
+        self.poll_next(cx)
+    }
 }
 
 impl Stream for Litep2pBackend {

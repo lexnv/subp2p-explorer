@@ -41,9 +41,6 @@ pub struct Behaviour {
     discovery: Kademlia<MemoryStore>,
 }
 
-// const YAMUX_WINDOW_SIZE: u32 = 256 * 1024;
-// const YAMUX_MAXIMUM_BUFFER_SIZE: usize = 16 * 1024 * 1024;
-
 impl Libp2pBackend {
     pub async fn new(genesis: String) -> Self {
         let local_key = libp2p::identity::Keypair::generate_ed25519();
@@ -213,6 +210,13 @@ impl crate::NetworkBackend for Libp2pBackend {
                 .await
                 .expect("Backend task closed; this should never happen");
         }
+    }
+
+    fn poll_next_event(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<Option<NetworkEvent>> {
+        self.poll_next(cx)
     }
 }
 
