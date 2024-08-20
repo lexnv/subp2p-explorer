@@ -1,5 +1,5 @@
 [package]
-name = "subp2p-explorer-cli"
+name = "subp2p-explorer-bench-cli"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -10,11 +10,11 @@ license.workspace = true
 description = "Command line utilities for working with subp2p-explorer"
 
 [[bin]]
-name = "subp2p-explorer-cli"
+name = "bench-cli"
 path = "src/main.rs"
 
 [dependencies]
-subp2p-explorer = { workspace = true }
+subp2p-explorer-core = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time", "rt-multi-thread"] }
 async-trait = { workspace = true }
 env_logger = { workspace = true }
@@ -43,3 +43,4 @@ trust-dns-resolver = { workspace = true }
 multihash-codetable = { workspace = true, features = ["digest", "serde", "sha2"] }
 jsonrpsee = { workspace = true, features = ["async-client", "client-ws-transport-native-tls"] }
 ss58-registry = { version = "1.34.0", default-features = false }
+serde = { workspace = true, features = ["derive"] }

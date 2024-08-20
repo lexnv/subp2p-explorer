@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "cli",
+    "bench-cli",
+
     "subp2p-explorer",
     "subp2p-explorer-core",
 ]
@@ -59,6 +61,7 @@ litep2p = "0.6.2"
 multiaddr = { version = "0.18.1" }
 multihash = { version = "0.19.1", default-features = false }
 libp2p-identity = { version = "0.2.9" }
+serde = "1.0"
 
 #workspace crates:
 subp2p-explorer = { version = "0.1.0", path = "subp2p-explorer", default-features = false }

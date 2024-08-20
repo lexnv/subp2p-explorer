@@ -4170,6 +4170,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "subp2p-explorer-bench-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec 0.6.2",
+ "bytes",
+ "clap",
+ "either",
+ "env_logger",
+ "fnv",
+ "futures",
+ "hex",
+ "ip_network",
+ "jsonrpsee",
+ "libp2p",
+ "log",
+ "maxminddb",
+ "multihash-codetable",
+ "parity-scale-codec",
+ "pin-project",
+ "primitive-types",
+ "rand",
+ "serde",
+ "serde_json",
+ "ss58-registry",
+ "subp2p-explorer-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "trust-dns-resolver",
+ "unsigned-varint 0.7.2",
+ "void",
+]
+
+[[package]]
 name = "subp2p-explorer-cli"
 version = "0.1.0"
 dependencies = [
