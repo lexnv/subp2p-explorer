@@ -20,7 +20,8 @@ where
     Backend: NetworkBackend + Stream<Item = NetworkEvent> + Unpin,
 {
     let mut peers_data = HashMap::new();
-    let mut queries = HashSet::new();
+    let mut queries = HashMap::new();
+    let mut query_times = Vec::with_capacity(1024);
 
     for (peer_id, address) in bootnodes {
         backend.add_known_peer(peer_id, vec![address]).await;
@@ -29,7 +30,7 @@ where
     log::info!("Discovering peers...");
     for _ in 0..10 {
         let query_id = backend.find_node(PeerId::random()).await;
-        queries.insert(query_id);
+        queries.insert(query_id, std::time::Instant::now());
     }
 
     while let Some(event) = backend.next().await {
@@ -47,8 +48,14 @@ where
             NetworkEvent::FindNode {
                 peers, query_id, ..
             } => {
-                log::info!("  Kademlia query finished {:?}", query_id);
-                queries.remove(&query_id);
+                if let Some(res) = queries.remove(&query_id) {
+                    log::info!(
+                        "    Kademlia query finished query={:?} time={:?}",
+                        query_id,
+                        res.elapsed()
+                    );
+                    query_times.push(res.elapsed());
+                }
 
                 peers.into_iter().for_each(|(peer, addresses)| {
                     let entry = peers_data.entry(peer).or_insert_with(|| HashSet::new());
@@ -67,9 +74,18 @@ where
 
         while queries.len() < 50 {
             let query_id = backend.find_node(PeerId::random()).await;
-            queries.insert(query_id);
+            queries.insert(query_id, std::time::Instant::now());
         }
     }
+
+    if query_times.is_empty() {
+        log::info!("No queries were completed");
+        return Ok(());
+    }
+
+    let average_query_time =
+        query_times.iter().sum::<std::time::Duration>() / query_times.len() as u32;
+    log::info!("Average query time: {:?}", average_query_time);
 
     Ok(())
 }
