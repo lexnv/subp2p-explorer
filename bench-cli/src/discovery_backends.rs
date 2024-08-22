@@ -22,6 +22,7 @@ where
     let mut peers_data = HashMap::new();
     let mut queries = HashMap::new();
     let mut query_times = Vec::with_capacity(1024);
+    let mut num_queries = 0;
 
     for (peer_id, address) in bootnodes {
         backend.add_known_peer(peer_id, vec![address]).await;
@@ -31,6 +32,7 @@ where
     for _ in 0..10 {
         let query_id = backend.find_node(PeerId::random()).await;
         queries.insert(query_id, std::time::Instant::now());
+        num_queries += 1;
     }
 
     while let Some(event) = backend.next().await {
@@ -75,8 +77,11 @@ where
         while queries.len() < 50 {
             let query_id = backend.find_node(PeerId::random()).await;
             queries.insert(query_id, std::time::Instant::now());
+            num_queries += 1;
         }
     }
+
+    log::info!("Queries completed: {} / {}", query_times.len(), num_queries);
 
     if query_times.is_empty() {
         log::info!("No queries were completed");
