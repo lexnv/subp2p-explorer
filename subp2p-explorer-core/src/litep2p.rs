@@ -1,4 +1,4 @@
-use futures::{Stream, StreamExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, Stream, StreamExt};
 use std::task::Poll;
 
 use crate::{
@@ -24,6 +24,8 @@ pub struct Litep2pBackend {
     kad_handle: KademliaHandle,
     ping_stream: Box<dyn Stream<Item = PingEvent> + Send + Unpin>,
     identify_stream: Box<dyn Stream<Item = IdentifyEvent> + Send + Unpin>,
+
+    pending_actions: FuturesUnordered<BoxFuture<'static, ()>>,
 }
 
 enum InnerCommand {
@@ -40,6 +42,8 @@ impl Litep2pBackend {
         // Genesis: 91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3.
         let (config, kad_handle) = kademlia::ConfigBuilder::new()
             .with_protocol_names(vec![format!("/{}/kad", genesis_hash).into()])
+            // To set the routing table to manual use:
+            // .with_routing_table_update_mode(RoutingTableUpdateMode::Manual)
             .build();
 
         let (identify_config, identify_event_stream) = IdentifyConfig::new(
@@ -82,6 +86,7 @@ impl Litep2pBackend {
             kad_handle,
             ping_stream: ping_event_stream,
             identify_stream: identify_event_stream,
+            pending_actions: FuturesUnordered::new(),
         }
     }
 }
@@ -127,6 +132,10 @@ impl Stream for Litep2pBackend {
     ) -> Poll<Option<Self::Item>> {
         let _ = self.ping_stream.poll_next_unpin(cx);
 
+        if !self.pending_actions.is_empty() {
+            let _ = self.pending_actions.poll_next_unpin(cx);
+        }
+
         if let Poll::Ready(Some(event)) = self.identify_stream.poll_next_unpin(cx) {
             let IdentifyEvent::PeerIdentified {
                 peer,
@@ -136,6 +145,23 @@ impl Stream for Litep2pBackend {
                 observed_address,
                 listen_addresses,
             } = event;
+
+            let tx = self.tx.clone();
+            let peer_id = peer.clone();
+            let pending_listen_addresses: Vec<_> = listen_addresses
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect();
+
+            self.pending_actions.push(Box::pin(async move {
+                tx.send(InnerCommand::AddKnownAddress {
+                    peer_id: peer_id.into(),
+                    address: pending_listen_addresses,
+                })
+                .await
+                .expect("Backend task closed; this should never happen");
+            }));
 
             return Poll::Ready(Some(NetworkEvent::PeerIdentified {
                 peer: peer.into(),
@@ -151,25 +177,41 @@ impl Stream for Litep2pBackend {
         }
 
         if let Poll::Ready(Some(event)) = self.kad_handle.poll_next_unpin(cx) {
-            if let KademliaEvent::FindNodeSuccess {
-                query_id,
-                target,
-                peers,
-            } = event
-            {
-                return Poll::Ready(Some(NetworkEvent::FindNode {
-                    query_id: crate::QueryId(query_id.0),
-                    target: target.into(),
-                    peers: peers
-                        .into_iter()
-                        .map(|(peer_id, addresses)| {
-                            (
-                                peer_id.into(),
-                                addresses.into_iter().map(Into::into).collect(),
-                            )
-                        })
-                        .collect(),
-                }));
+            match event {
+                KademliaEvent::FindNodeSuccess {
+                    query_id,
+                    target,
+                    peers,
+                } => {
+                    return Poll::Ready(Some(NetworkEvent::FindNode {
+                        query_id: crate::QueryId(query_id.0),
+                        target: target.into(),
+                        peers: peers
+                            .into_iter()
+                            .map(|(peer_id, addresses)| {
+                                (
+                                    peer_id.into(),
+                                    addresses.into_iter().map(Into::into).collect(),
+                                )
+                            })
+                            .collect(),
+                    }));
+                }
+
+                KademliaEvent::RoutingTableUpdate { .. } => {}
+
+                KademliaEvent::QueryFailed { query_id } => {
+                    log::warn!("Query failed: {:?}", query_id)
+                }
+
+                _ => {
+                    // Since we are only interested in some events from the backend,
+                    // we need to wake up the task again to poll for more events.
+                    // Otherwise, we would be stuck in the pending state since no external
+                    // event will ever call cx.waker().wake_by_ref() again.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
             }
         }
 
