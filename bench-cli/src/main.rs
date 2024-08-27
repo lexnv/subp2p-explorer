@@ -4,7 +4,7 @@
 
 use clap::Parser as ClapParser;
 use serde::Serialize;
-use std::error::Error;
+use std::{error::Error, path::PathBuf};
 
 mod discovery_backends;
 
@@ -46,6 +46,10 @@ pub struct DiscoverBackendsNetworkOpts {
     /// The backend type to use for the discovery process.
     #[clap(long, short)]
     backend_type: BackendType,
+
+    /// The data set to use for the discovery process.
+    #[clap(long, value_parser)]
+    data_set: Option<PathBuf>,
 }
 
 #[tokio::main]

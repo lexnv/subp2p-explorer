@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::str::FromStr;
 
 use futures::{Stream, StreamExt};
 use subp2p_explorer_core::NetworkBackend;
@@ -15,6 +16,7 @@ pub async fn discovery<Backend>(
     mut backend: Backend,
     bootnodes: Vec<(PeerId, Multiaddr)>,
     num_peers: usize,
+    peer_ids: Vec<PeerId>,
 ) -> Result<(), Box<dyn Error>>
 where
     Backend: NetworkBackend + Stream<Item = NetworkEvent> + Unpin,
@@ -23,6 +25,7 @@ where
     let mut queries = HashMap::new();
     let mut query_times = Vec::with_capacity(1024);
     let mut num_queries = 0;
+    let mut peer_iter = peer_ids.into_iter();
 
     for (peer_id, address) in bootnodes {
         backend.add_known_peer(peer_id, vec![address]).await;
@@ -30,7 +33,7 @@ where
 
     log::info!("Discovering peers...");
     for _ in 0..10 {
-        let query_id = backend.find_node(PeerId::random()).await;
+        let query_id = backend.find_node(peer_iter.next().unwrap()).await;
         queries.insert(query_id, std::time::Instant::now());
         num_queries += 1;
     }
@@ -75,7 +78,7 @@ where
         }
 
         while queries.len() < 50 {
-            let query_id = backend.find_node(PeerId::random()).await;
+            let query_id = backend.find_node(peer_iter.next().unwrap()).await;
             queries.insert(query_id, std::time::Instant::now());
             num_queries += 1;
         }
@@ -95,7 +98,30 @@ where
     Ok(())
 }
 
+fn get_peer_ids(opts: &DiscoverBackendsNetworkOpts) -> Vec<PeerId> {
+    let Some(data_set) = &opts.data_set else {
+        let peer_ids = (0..1024).map(|_| PeerId::random()).collect::<Vec<_>>();
+        let collected = peer_ids
+            .clone()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        std::fs::write("dataset-latest.txt", collected).expect("Cannot write file");
+
+        return peer_ids;
+    };
+
+    let file = std::fs::read_to_string(data_set).expect("Cannot open file");
+    file.split(",")
+        .map(|line| PeerId::from_str(line.trim()).expect("Valid peer ID; qed"))
+        .collect()
+}
+
 pub async fn discovery_backends(opts: DiscoverBackendsNetworkOpts) -> Result<(), Box<dyn Error>> {
+    let peer_ids = get_peer_ids(&opts);
+
     // Parse the provided bootnodes as `PeerId` and `MultiAddress`.
     let bootnodes: Vec<_> = opts
         .bootnodes
@@ -116,12 +142,12 @@ pub async fn discovery_backends(opts: DiscoverBackendsNetworkOpts) -> Result<(),
         crate::BackendType::Litep2p => {
             let backend = subp2p_explorer_core::litep2p::Litep2pBackend::new(opts.genesis);
 
-            discovery(backend, bootnodes, opts.num_peers).await?;
+            discovery(backend, bootnodes, opts.num_peers, peer_ids).await?;
         }
         crate::BackendType::Libp2p => {
             let backend = subp2p_explorer_core::libp2p::Libp2pBackend::new(opts.genesis).await;
 
-            discovery(backend, bootnodes, opts.num_peers).await?;
+            discovery(backend, bootnodes, opts.num_peers, peer_ids).await?;
         }
     };
 
