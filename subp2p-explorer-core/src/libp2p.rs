@@ -1,11 +1,11 @@
-use futures::{Stream, StreamExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, Stream, StreamExt};
 
 use async_trait::async_trait;
 use libp2p::{
     identify::{Behaviour as Identify, Config as IdentifyConfig, Event as IdentifyEvent},
     kad::{
-        store::MemoryStore, Behaviour as Kademlia, Event as KademliaEvent, GetClosestPeersError,
-        QueryResult,
+        store::MemoryStore, Behaviour as Kademlia, BucketInserts, Event as KademliaEvent,
+        GetClosestPeersError, QueryResult,
     },
     ping::Behaviour as Ping,
     swarm::NetworkBehaviour,
@@ -28,6 +28,8 @@ pub struct Libp2pBackend {
     query_translate: HashMap<libp2p::kad::QueryId, QueryId>,
     peer_addresses: HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>>,
     next_query_id: AtomicUsize,
+
+    pending_actions: FuturesUnordered<BoxFuture<'static, ()>>,
 }
 
 /// Network behavior for subtrate based chains.
@@ -51,6 +53,9 @@ impl Libp2pBackend {
 
         let mut disc_config =
             libp2p::kad::Config::new(StreamProtocol::try_from_owned(kad_protocol).unwrap());
+
+        disc_config.set_kbucket_inserts(BucketInserts::Manual);
+
         disc_config.set_max_packet_size(8192);
         disc_config.set_record_ttl(None);
         disc_config.set_provider_record_ttl(None);
@@ -151,6 +156,8 @@ impl Libp2pBackend {
             query_translate: HashMap::new(),
             next_query_id: AtomicUsize::new(0),
             peer_addresses: HashMap::new(),
+
+            pending_actions: FuturesUnordered::new(),
         }
     }
 }
@@ -229,6 +236,10 @@ impl Stream for Libp2pBackend {
     ) -> Poll<Option<Self::Item>> {
         let this = std::pin::Pin::into_inner(self);
 
+        if !this.pending_actions.is_empty() {
+            let _ = this.pending_actions.poll_next_unpin(cx);
+        }
+
         let result = this.rx.poll_recv(cx);
         let event = match result {
             Poll::Ready(Some(event)) => event,
@@ -262,7 +273,10 @@ impl Stream for Libp2pBackend {
                     } => {
                         let (key, peers) = match result {
                             Ok(res) => (res.key, res.peers),
-                            Err(GetClosestPeersError::Timeout { key, peers }) => (key, peers),
+                            Err(GetClosestPeersError::Timeout { key, peers }) => {
+                                log::warn!("Query timed out for key {:?} {:?}", key, id);
+                                (key, peers)
+                            }
                         };
 
                         // Get the subp2p query ID.
@@ -286,6 +300,18 @@ impl Stream for Libp2pBackend {
                     // Collect addresses during discovery.
                     KademliaEvent::RoutablePeer { peer, address }
                     | KademliaEvent::PendingRoutablePeer { peer, address } => {
+                        let command_rx = this.command_tx.clone();
+                        let pending_address = address.clone();
+                        this.pending_actions.push(Box::pin(async move {
+                            command_rx
+                                .send(InnerCommand::AddKnownAddress {
+                                    peer_id: peer,
+                                    address: pending_address,
+                                })
+                                .await
+                                .expect("Backend task closed; this should never happen");
+                        }));
+
                         this.peer_addresses
                             .entry(peer)
                             .or_insert_with(Vec::new)
