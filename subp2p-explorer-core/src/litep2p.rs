@@ -33,6 +33,9 @@ enum InnerCommand {
         peer_id: PeerId,
         address: Vec<Multiaddr>,
     },
+    ListenAddresses {
+        tx: tokio::sync::oneshot::Sender<Vec<Multiaddr>>,
+    },
 }
 
 impl Litep2pBackend {
@@ -71,6 +74,9 @@ impl Litep2pBackend {
                         match event {
                             Some(InnerCommand::AddKnownAddress { peer_id, address }) => {
                                 litep2p.add_known_address(peer_id.into(), address.into_iter().map(Into::into));
+                            },
+                            Some(InnerCommand::ListenAddresses { tx }) => {
+                                let _ = tx.send(litep2p.listen_addresses().cloned().map(Into::into).collect());
                             },
                             _ => return,
                         }
@@ -113,6 +119,19 @@ impl crate::NetworkBackend for Litep2pBackend {
                 address.into_iter().map(Into::into).collect(),
             )
             .await;
+    }
+
+    async fn listen_addresses(&mut self) -> Vec<Multiaddr> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let _ = self
+            .tx
+            .send(InnerCommand::ListenAddresses { tx })
+            .await
+            .expect("Backend task closed; this should never happen");
+
+        rx.await
+            .expect("Backend task closed; this should never happen")
     }
 
     fn poll_next_event(

@@ -76,4 +76,7 @@ pub trait NetworkBackend {
     ///
     /// This should be called with the bootnodes of the network before starting the discovery process.
     async fn add_known_peer(&mut self, peer_id: PeerId, address: Vec<Multiaddr>);
+
+    /// Get the listen addresses of the network backend.
+    async fn listen_addresses(&mut self) -> Vec<Multiaddr>;
 }

@@ -219,6 +219,10 @@ impl crate::NetworkBackend for Libp2pBackend {
         }
     }
 
+    async fn listen_addresses(&mut self) -> Vec<Multiaddr> {
+        vec![]
+    }
+
     fn poll_next_event(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context,
