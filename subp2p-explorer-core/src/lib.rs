@@ -1,6 +1,7 @@
 pub mod types;
 
 use async_trait::async_trait;
+use futures::Stream;
 use std::collections::HashSet;
 use types::{multiaddr::Multiaddr, peer_id::PeerId};
 
@@ -53,7 +54,7 @@ pub enum NetworkEvent {
 ///
 /// This trait exposes the necessary methods to interact with the network backend.
 #[async_trait]
-pub trait NetworkBackend {
+pub trait NetworkBackend: Stream<Item = NetworkEvent> {
     /// Get the next event from the network backend.
     ///
     /// This method must be polled to advance the state of the network backend.
