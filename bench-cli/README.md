@@ -29,3 +29,19 @@ cargo run -- discovery --genesis b0a8d493285c2df73290dfb7e61f870f17b41801197a149
 ```bash
 cargo run -- discovery --genesis b0a8d493285c2df73290dfb7e61f870f17b41801197a149ca93654499ea3dafe --bootnodes /dns/kusama-bootnode-0.polkadot.io/tcp/30333/p2p/12D3KooWSueCPH3puP2PcvqPJdNaDNF3jMZjtJtDiSy35pWrbt5h --backend-type litep2p --num-peers 100
 ```
+
+### Discovery Kademlia Benchmarking (local chains)
+
+This command spawns a local network of litep2p nodes and connects them in a ring topology.
+
+- Benchmark the discovery process on a local chain using the litep2p backend for discovery with 200 peers:
+
+```bash
+RUST_LOG=info cargo run -- discovery-local --backend-type litep2p --num-peers 40 --network-size 200
+```
+
+- Benchmark the discovery process on a local chain using the libp2p backend for discovery with 200 peers:
+
+```bash
+RUST_LOG=info cargo run -- discovery-local --backend-type libp2p --num-peers 40 --network-size 200
+```
