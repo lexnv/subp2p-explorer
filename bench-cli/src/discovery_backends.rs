@@ -102,7 +102,7 @@ where
 
 fn get_peer_ids(opts: &DiscoverBackendsNetworkOpts) -> Vec<PeerId> {
     let Some(data_set) = &opts.data_set else {
-        let peer_ids = (0..1024).map(|_| PeerId::random()).collect::<Vec<_>>();
+        let peer_ids = (0..1024 * 12).map(|_| PeerId::random()).collect::<Vec<_>>();
         let collected = peer_ids
             .clone()
             .into_iter()
