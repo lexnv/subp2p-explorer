@@ -14,6 +14,7 @@ use litep2p::{
         kademlia::{self, *},
         ping::{Config as PingConfig, PingEvent},
     },
+    transport::tcp::config::Config as TcpConfig,
     Litep2p,
 };
 
@@ -57,7 +58,12 @@ impl Litep2pBackend {
 
         let litep2p_config = ConfigBuilder::new()
             // `litep2p` will bind to `/ip6/::1/tcp/0` by default
-            .with_tcp(Default::default())
+            .with_tcp(TcpConfig {
+                listen_addresses: vec!["/ip6/::/tcp/0".parse().expect("valid address")],
+                reuse_port: true,
+                nodelay: true,
+                ..Default::default()
+            })
             .with_websocket(Default::default())
             .with_libp2p_ping(ping_config)
             .with_libp2p_kademlia(config)
