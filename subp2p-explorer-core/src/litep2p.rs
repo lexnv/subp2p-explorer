@@ -53,7 +53,6 @@ impl Litep2pBackend {
         let (identify_config, identify_event_stream) = IdentifyConfig::new(
             "subp2p-explorer-0.1".into(),
             Some("subp2p-explorer".to_string()),
-            vec![],
         );
 
         let litep2p_config = ConfigBuilder::new()
