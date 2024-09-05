@@ -78,7 +78,9 @@ where
         }
 
         while queries.len() < 50 {
-            let query_id = backend.find_node(peer_iter.next().unwrap()).await;
+            let query_id = backend
+                .find_node(peer_iter.next().unwrap_or_else(|| PeerId::random()))
+                .await;
             queries.insert(query_id, std::time::Instant::now());
             num_queries += 1;
         }
