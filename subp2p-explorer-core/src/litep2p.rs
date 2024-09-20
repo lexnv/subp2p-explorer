@@ -47,7 +47,7 @@ impl Litep2pBackend {
         let (config, kad_handle) = kademlia::ConfigBuilder::new()
             .with_protocol_names(vec![format!("/{}/kad", genesis_hash).into()])
             // To set the routing table to manual use:
-            // .with_routing_table_update_mode(RoutingTableUpdateMode::Manual)
+            .with_routing_table_update_mode(RoutingTableUpdateMode::Manual)
             .build();
 
         let (identify_config, identify_event_stream) = IdentifyConfig::new(
