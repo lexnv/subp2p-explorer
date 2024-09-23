@@ -17,6 +17,8 @@ use libp2p::{
 };
 use multihash_codetable::{Code, MultihashDigest};
 use rand::{seq::SliceRandom, thread_rng};
+use serde::Deserialize;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use subp2p_explorer::{
     peer_behavior::PeerInfoEvent,
@@ -67,7 +69,7 @@ async fn runtime_api_autorities(
 const MAX_QUERIES: usize = 8;
 
 /// Discover the authorities on the network.
-struct AuthorityDiscovery {
+pub struct AuthorityDiscovery {
     /// Drive the network behavior.
     swarm: Swarm<Behaviour>,
 
@@ -106,13 +108,24 @@ struct AuthorityDiscovery {
 }
 
 /// The peer details extracted from the DHT.
-#[derive(Clone)]
-struct PeerDetails {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PeerDetails {
     /// Authority ID from the runtime API.
     #[allow(unused)]
     authority_id: sr25519::PublicKey,
     /// Discovered from the DHT.
     addresses: HashSet<Multiaddr>,
+}
+
+impl PeerDetails {
+    pub fn addresses(&self) -> &HashSet<Multiaddr> {
+        &self.addresses
+    }
+
+    pub fn authority_id(&self) -> &sr25519::PublicKey {
+        &self.authority_id
+    }
+
 }
 
 impl AuthorityDiscovery {
@@ -399,6 +412,22 @@ impl AuthorityDiscovery {
             }
         }
     }
+
+    /// Returns a reference to the discovered peer details.
+    pub fn peer_details(&self) -> &HashMap<PeerId, PeerDetails> {
+        &self.peer_details
+    }
+
+    /// Returns a reference to the discovered peer info.
+    pub fn peer_info(&self) -> &HashMap<PeerId, Info> {
+        &self.peer_info
+    }
+
+    /// Returns a reference to the mapping between the authority discovery public key and the
+    /// discovered addresses.
+    pub fn authority_to_details(&self) -> &HashMap<sr25519::PublicKey, HashSet<Multiaddr>> {
+        &self.authority_to_details
+    }
 }
 
 /// Reach a single peer and query the identify protocol.
@@ -481,7 +510,7 @@ pub async fn discover_authorities(
     timeout: std::time::Duration,
     address_format: String,
     raw_output: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(AuthorityDiscovery, Vec<sr25519::PublicKey>), Box<dyn std::error::Error>> {
     let format_registry =
         ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
             .map_err(|err| format!("Cannot parse the provided address format: {:?}", err))?;
@@ -564,5 +593,5 @@ pub async fn discover_authorities(
         }
     }
 
-    Ok(())
+    Ok((authority_discovery, authorities))
 }

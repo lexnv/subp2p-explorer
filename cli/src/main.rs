@@ -196,7 +196,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.address_format,
                 opts.raw_output,
             )
-            .await
+            .await.map(|_|())
         }
     }
 }
