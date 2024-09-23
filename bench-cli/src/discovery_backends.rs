@@ -46,9 +46,11 @@ where
                 ..
             } => {
                 let entry = peers_data.entry(peer).or_insert_with(|| HashSet::new());
-                listen_addresses.into_iter().for_each(|address| {
+                listen_addresses.clone().into_iter().for_each(|address| {
                     entry.insert(address);
                 });
+
+                backend.add_known_peer(peer, listen_addresses).await;
             }
             NetworkEvent::FindNode {
                 peers, query_id, ..
@@ -62,12 +64,14 @@ where
                     query_times.push(res.elapsed());
                 }
 
-                peers.into_iter().for_each(|(peer, addresses)| {
+                for (peer, addresses) in peers {
+                    backend.add_known_peer(peer, addresses.clone()).await;
+
                     let entry = peers_data.entry(peer).or_insert_with(|| HashSet::new());
                     addresses.into_iter().for_each(|address| {
                         entry.insert(address);
                     });
-                });
+                }
             }
         }
 
