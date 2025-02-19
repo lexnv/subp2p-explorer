@@ -125,7 +125,6 @@ impl PeerDetails {
     pub fn authority_id(&self) -> &sr25519::PublicKey {
         &self.authority_id
     }
-
 }
 
 impl AuthorityDiscovery {
@@ -536,6 +535,7 @@ pub async fn discover_authorities(
     log::info!("Finished discovery\n");
 
     let mut reached_peers = 0;
+    let mut litep2p = 0;
 
     for authority in &authorities {
         let Some(details) = authority_discovery.authority_to_details.get(authority) else {
@@ -559,6 +559,10 @@ pub async fn discover_authorities(
         let info = authority_discovery.peer_info.get(&peer_id).cloned();
         if let Some(info) = info {
             reached_peers += 1;
+
+            if info.agent_version.contains("litep2p") {
+                litep2p += 1;
+            }
 
             println!(
                 "authority={:?} peer_id={:?} addresses={:?} version={:?} ",
@@ -592,6 +596,8 @@ pub async fn discover_authorities(
             println!("peer_id={:?} info={:?}", peer_id, info);
         }
     }
+
+    println!(" Litep2p authorities {}", litep2p);
 
     Ok((authority_discovery, authorities))
 }
