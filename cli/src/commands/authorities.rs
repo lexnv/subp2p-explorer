@@ -437,7 +437,7 @@ impl AuthorityDiscovery {
 /// However, the address cannot be reached directly.
 /// For this to work, we'd need to implement NAT hole punching.
 ///
-/// ```rust
+/// ```ignore
 /// let addr =
 ///     "/ip4/34.92.86.244/tcp/40333/p2p/12D3KooWKxsprneVYQxxPnPUwDA5p2huuCbZCNyuSHTmKDv3vT2n";
 /// let addr: Multiaddr = addr.parse().expect("Valid multiaddress; qed");

@@ -114,6 +114,7 @@ pub enum NotificationsHandlerToBehavior {
 ///
 /// ### Transitions
 ///
+/// ```ignore
 /// Closed -> OpenDesiredByRemote
 ///                 |
 ///                 |
@@ -122,7 +123,7 @@ pub enum NotificationsHandlerToBehavior {
 ///                 |---------------  behavior ack
 ///                 |
 ///           OpenDesiredByRemote -> Opening -> Open
-///
+/// ```
 pub enum State {
     /// Protocol is closed.
     Closed {
