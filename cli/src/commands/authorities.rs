@@ -501,6 +501,54 @@ impl PeerInfo {
     }
 }
 
+pub async fn discover_broken_peers() {
+    let addresses = vec![
+        "/ip4/34.141.33.187/tcp/49252/ws/p2p/12D3KooWA5qwyqspjVvXUmceo216sVLasDKoZ72YD6DogsAjW5NQ",
+        "/ip4/34.96.236.170/tcp/40333/p2p/12D3KooWKxcqsx8NfgCynJEnYVAR97tpLz3Z4ej6w2fHcAeYsSRs",
+        "/ip4/35.198.115.93/tcp/40333/p2p/12D3KooWLsvT7bmAraci1H1kUEYk9JqtVQUjcT7U1rb1XKkp2fqX",
+        "/ip4/34.159.54.107/tcp/40333/p2p/12D3KooWREothWVoput7tBdLvqrfDhv9ExVU24F6JeMHAnmKsF2i",
+        "/ip4/34.92.216.190/tcp/40333/p2p/12D3KooWRbgpdd4tyhWLnmG7rNMUcunminxn8et5e7RLD9eDd37t",
+        "/ip4/34.141.73.92/tcp/40333/p2p/12D3KooWM1QCDewgS473RqC8oREG2BypTcPYdBev5bGZeUBQMDs1",
+        "/ip4/34.150.62.70/tcp/40333/p2p/12D3KooWJJouKUsVPo2Ak48soKUzno3LqM57YofqJmjoydN4Az4K",
+        "/ip4/35.242.216.99/tcp/40333/p2p/12D3KooWKL9z3MGWCSdRKjvsz37U9CLkJZvQNznFkit4KNvBPuX2",
+        "/ip4/35.234.126.251/tcp/40333/p2p/12D3KooWSENpNSRNHSQFoKjhAeqyqgk7JBRDp4B9awZ8mZueEQ3V",
+        "/ip4/35.234.114.245/tcp/48368/ws/p2p/12D3KooWFYMEWPV8Eyzed2Bwvc3ZPUNU9phHg2thTNyS6bP7p4B9",
+        "/ip4/164.100.30.1/tcp/30301/p2p/12D3KooWFZ3mzqsSa434ieegHEkRbC2FJKMV4jmJNW5wUav6Zmxk",
+        "/ip4/164.100.20.1/tcp/30301/p2p/12D3KooWFZ3mzqsSa434ieegHEkRbC2FJKMV4jmJNW5wUav6Zmxk",
+        "/ip4/164.100.10.1/tcp/30301/p2p/12D3KooWFZ3mzqsSa434ieegHEkRbC2FJKMV4jmJNW5wUav6Zmxk",
+        "/ip4/128.0.0.1/tcp/30301/p2p/12D3KooWFZ3mzqsSa434ieegHEkRbC2FJKMV4jmJNW5wUav6Zmxk",
+        "/ip4/35.204.42.115/tcp/30301/p2p/12D3KooWFZ3mzqsSa434ieegHEkRbC2FJKMV4jmJNW5wUav6Zmxk",
+        "/ip4/197.85.7.215/tcp/30333/p2p/12D3KooWFhA19k1nR3PaDH5biTKiRUSGnG4shCx6y67wVEmvFPWP",
+        "/ip4/35.242.240.208/tcp/53194/ws/p2p/12D3KooWPnfhV5fGbEY2VJ78zgiEWcXpm9HvqE84JRxXbizd89hD",
+        "/ip4/34.96.215.252/tcp/40333/p2p/12D3KooWPSeDKcVi5rjAfPf9zZLY62d5MxN7BwjFrLwDP71uuEcb",
+        "/ip4/34.40.14.29/tcp/40333/p2p/12D3KooWJGQbvUBAPC3UH5Dj2wGqQhx6Gm9AJaTEE5RxPqg5b7a7",
+        "/ip4/34.92.229.252/tcp/40333/p2p/12D3KooWRn2iumqCLj7yLT43vQRqs6PrrVLEuEj4h6d9EEMYpGft",
+        "/ip4/202.61.202.59/tcp/30334/p2p/12D3KooWGdpsK3e4A1aNHHY6MPCAvyoVGLYDSmqhAy9vQuCMzdAE",
+        "/ip4/34.92.195.49/tcp/40333/p2p/12D3KooWCGgfCy9CBGvsGGNPmSiAGdTUx2HAHHwobpPcQi9rsiw5",
+        "/ip4/35.220.201.253/tcp/40333/p2p/12D3KooWNhpCGu9mRMaARZzASoLNxw3nWbhtkLgjyU2Zj1rnnJgJ",
+        "/ip4/34.150.15.64/tcp/40333/p2p/12D3KooWFjcVemzXMJPmec1mgM4TmKs4RhhiMuJJppexwzGry8mo",
+        "/ip4/34.107.54.51/tcp/43396/ws/p2p/12D3KooWCrPfvUV3GVMdrLJgxAu5mAY7Sx3XSYpXJfUQdBNHvSiW",
+        "/ip4/34.40.19.86/tcp/60706/ws/p2p/12D3KooWLpQyJ81pYocFKrgc5bJMdztU4tQPs1Zw9UrrY9FeMiVd",
+        "/ip4/185.111.108.44/tcp/35136/p2p/12D3KooWRGemLnZU3HJNxgJXwPzACt18EYarf1YSEjWE52PV4rsA",
+        "/ip4/185.111.108.44/tcp/35099/p2p/12D3KooWRGemLnZU3HJNxgJXwPzACt18EYarf1YSEjWE52PV4rsA",
+    ];
+
+    for address in addresses {
+        log::info!("Discovering address... {}", address);
+
+        let address: Multiaddr = address.parse().expect("Valid multiaddress; qed");
+        let peer_id = get_peer_id(&address).expect("Provided peer id; qed");
+
+        let info = PeerInfo::new(Keypair::generate_ed25519(), vec![address]);
+
+        let timeout = tokio::time::Duration::from_secs(30);
+
+        let result = tokio::time::timeout(timeout, info.discover()).await;
+
+        log::info!("Discovered peer {:?} with timeout {:?}", peer_id, result);
+    }
+}
+
 /// Entry function called from the CLI.
 pub async fn discover_authorities(
     url: String,
@@ -510,6 +558,8 @@ pub async fn discover_authorities(
     address_format: String,
     raw_output: bool,
 ) -> Result<(AuthorityDiscovery, Vec<sr25519::PublicKey>), Box<dyn std::error::Error>> {
+    discover_broken_peers().await;
+
     let format_registry =
         ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
             .map_err(|err| format!("Cannot parse the provided address format: {:?}", err))?;
