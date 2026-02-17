@@ -118,7 +118,7 @@ pub(crate) async fn runtime_api_autorities(
 }
 
 /// The maximum number of Kademlia `get-records` queried a time.
-const MAX_QUERIES: usize = 64;
+const MAX_QUERIES: usize = 128;
 
 /// Discover the authorities on the network.
 pub struct AuthorityDiscovery {
