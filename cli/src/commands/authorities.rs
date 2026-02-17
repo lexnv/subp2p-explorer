@@ -71,7 +71,7 @@ const KNOWN_CHAINS: &[&str] = &["kusama", "paseo", "westend", "polkadot"];
 /// "polkadot" (in that order — kusama before polkadot because
 /// `kusama-rpc.polkadot.io` contains both). This also handles URLs like
 /// `wss://rpc.ibp.network/paseo` where the chain name is in the path.
-pub(crate) fn detect_chain_name(url: &Url) -> Option<&'static str> {
+pub fn detect_chain_name(url: &Url) -> Option<&'static str> {
     let host = url.host_str().unwrap_or("");
     let path = url.path();
     KNOWN_CHAINS
@@ -113,47 +113,50 @@ pub(crate) async fn fetch_bootnodes_from_chainspec(
 pub(crate) async fn resolve_bootnodes(
     rpc_url: &Url,
     cli_bootnodes: Vec<String>,
+    w: &mut impl Write,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut bootnodes = if cli_bootnodes.is_empty() {
-        println!("       No bootnodes provided, fetching from chain spec via RPC...");
+        writeln!(w, "       No bootnodes provided, fetching from chain spec via RPC...")?;
         let fetched = fetch_bootnodes_from_rpc(rpc_url.clone()).await?;
-        println!("       Fetched {} bootnodes from RPC", fetched.len());
+        writeln!(w, "       Fetched {} bootnodes from RPC", fetched.len())?;
         fetched
     } else {
         cli_bootnodes
     };
 
     if let Some(chain) = detect_chain_name(rpc_url) {
-        println!("       Detected known chain \"{}\", downloading published chainspec bootnodes...", chain);
+        writeln!(w, "       Detected known chain \"{}\", downloading published chainspec bootnodes...", chain)?;
         match fetch_bootnodes_from_chainspec(chain).await {
             Ok(extra) => {
                 let unique_peers: HashSet<_> = extra
                     .iter()
                     .filter_map(|addr| addr.rsplit("/p2p/").next())
                     .collect();
-                println!(
+                writeln!(
+                    w,
                     "       Fetched from chainspec online {} addresses and {} bootnodes",
                     extra.len(),
                     unique_peers.len()
-                );
+                )?;
                 let mut seen: HashSet<String> = bootnodes.drain(..).collect();
                 let before = seen.len();
                 seen.extend(extra);
-                println!(
+                writeln!(
+                    w,
                     "       Merged to {} unique addresses ({} new from chainspec)",
                     seen.len(),
                     seen.len() - before
-                );
+                )?;
                 bootnodes = seen.into_iter().collect();
             }
             Err(e) => {
                 log::warn!("Failed to fetch published chainspec bootnodes for {}: {}", chain, e);
-                println!("       Warning: could not fetch published chainspec bootnodes: {}", e);
+                writeln!(w, "       Warning: could not fetch published chainspec bootnodes: {}", e)?;
             }
         }
     }
 
-    println!();
+    writeln!(w)?;
     Ok(bootnodes)
 }
 
@@ -475,6 +478,14 @@ impl AuthorityDiscovery {
                                     authority_id: authority,
                                     addresses: addresses.iter().cloned().collect(),
                                 });
+
+                            // Dial the peer so the identify protocol can run.
+                            if !self.peer_info.contains_key(&peer_id) {
+                                for addr in &addresses {
+                                    self.swarm.behaviour_mut().discovery.add_address(&peer_id, addr.clone());
+                                }
+                                let _ = self.swarm.dial(peer_id);
+                            }
 
                             log::debug!(
                                 "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",

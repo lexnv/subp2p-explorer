@@ -63,6 +63,7 @@ multihash = { version = "0.19.1", default-features = false }
 libp2p-identity = { version = "0.2.9" }
 serde = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
+chrono = "0.4"
 
 #workspace crates:
 subp2p-explorer = { version = "0.1.0", path = "subp2p-explorer", default-features = false }

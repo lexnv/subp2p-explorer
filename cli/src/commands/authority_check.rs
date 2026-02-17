@@ -3,8 +3,8 @@
 // see LICENSE for license details.
 
 use crate::commands::authorities::{
-    fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes, runtime_api_autorities,
-    AuthorityDiscovery,
+    detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
+    runtime_api_autorities, AuthorityDiscovery,
 };
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
@@ -12,6 +12,8 @@ use jsonrpsee::client_transport::ws::Url;
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 use std::time::{Duration, Instant};
 use subp2p_explorer::util::p2p::get_peer_id;
 use subp2p_explorer::util::ss58::to_ss58;
@@ -19,6 +21,59 @@ use tokio::net::TcpStream;
 
 /// Maximum number of concurrent TCP connection checks.
 const MAX_PARALLEL_CHECKS: usize = 64;
+
+/// Writer that duplicates output to stdout and an optional log file.
+struct DualWriter {
+    file: Option<BufWriter<File>>,
+}
+
+impl DualWriter {
+    fn new(file: Option<File>) -> Self {
+        DualWriter {
+            file: file.map(BufWriter::new),
+        }
+    }
+}
+
+/// Strip ANSI escape sequences (`\x1b[...m`) from a byte slice.
+fn strip_ansi(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b'\x1b' && buf.get(i + 1) == Some(&b'[') {
+            // Skip past the closing 'm'.
+            i += 2;
+            while i < buf.len() && buf[i] != b'm' {
+                i += 1;
+            }
+            if i < buf.len() {
+                i += 1; // skip 'm'
+            }
+        } else {
+            out.push(buf[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+impl Write for DualWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::stdout().write_all(buf)?;
+        if let Some(ref mut f) = self.file {
+            f.write_all(&strip_ansi(buf))?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()?;
+        if let Some(ref mut f) = self.file {
+            f.flush()?;
+        }
+        Ok(())
+    }
+}
 
 /// Result of checking a single address.
 enum AddressResult {
@@ -105,6 +160,7 @@ async fn check_tcp_reachable(endpoint: &str, timeout: Duration) -> Result<(), St
 async fn run_connectivity_checks(
     checks: Vec<(usize, Multiaddr, bool)>,
     dial_timeout: Duration,
+    w: &mut DualWriter,
 ) -> HashMap<usize, Vec<AddressCheck>> {
     let total = checks.len();
     let public_count = checks.iter().filter(|(_, _, p)| *p).count();
@@ -139,7 +195,8 @@ async fn run_connectivity_checks(
         .await;
 
     let elapsed = start.elapsed();
-    println!(
+    let _ = writeln!(
+        w,
         "       Checked {} addresses ({} public) in {:.1}s",
         total,
         public_count,
@@ -154,44 +211,39 @@ async fn run_connectivity_checks(
 }
 
 /// Print the per-authority check result in a formatted table.
-fn print_authority_result(result: &AuthorityResult, index: usize) {
-    println!("────────────────────────────────────────────────────────────────────────");
-    print!("  Authority #{}: {}", index + 1, result.authority_ss58);
+fn print_authority_result(w: &mut DualWriter, result: &AuthorityResult, index: usize) -> io::Result<()> {
+    writeln!(w, "────────────────────────────────────────────────────────────────────────")?;
+    write!(w, "  Authority #{}: {}", index + 1, result.authority_ss58)?;
 
     if !result.has_dht_record {
-        println!(" — No DHT record");
-        return;
+        writeln!(w, " — No DHT record")?;
+        return Ok(());
     }
-    println!();
+    writeln!(w)?;
 
     if let Some(ref peer_id) = result.peer_id {
-        println!("  PeerId: {}", peer_id);
+        writeln!(w, "  PeerId: {}", peer_id)?;
     }
     if let Some(ref agent) = result.agent_version {
-        println!("  Agent:  {}", agent);
+        writeln!(w, "  Agent:  {}", agent)?;
     }
 
     if result.addresses.is_empty() {
-        println!("  No addresses in DHT record");
-        return;
+        writeln!(w, "  No addresses in DHT record")?;
+        return Ok(());
     }
 
-    println!();
+    writeln!(w)?;
 
     let max_len = result
         .addresses
         .iter()
         .map(|a| a.address_short.len())
         .max()
-        .unwrap_or(30)
-        .min(65);
+        .unwrap_or(30);
 
     for check in &result.addresses {
-        let addr = if check.address_short.len() > max_len {
-            format!("{}...", &check.address_short[..max_len - 3])
-        } else {
-            format!("{:<width$}", check.address_short, width = max_len)
-        };
+        let addr = format!("{:<width$}", check.address_short, width = max_len);
 
         let kind = if check.is_public {
             "public "
@@ -205,7 +257,7 @@ fn print_authority_result(result: &AuthorityResult, index: usize) {
             AddressResult::Skipped(r) => format!("\x1b[33mSKIP\x1b[0m ({})", r),
         };
 
-        println!("    {} | {} | {}", addr, kind, status);
+        writeln!(w, "    {} | {} | {}", addr, kind, status)?;
     }
 
     let total = result.addresses.len();
@@ -228,11 +280,13 @@ fn print_authority_result(result: &AuthorityResult, index: usize) {
         "N/A".to_string()
     };
 
-    println!();
-    println!(
+    writeln!(w)?;
+    writeln!(
+        w,
         "    Reachable: {}/{} public ({}) | Total: {} addrs ({} public, {} private)",
         reachable, public_tested, pct, total, public, private
-    );
+    )?;
+    Ok(())
 }
 
 /// Normalize an agent version string for aggregation.
@@ -331,7 +385,7 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
 }
 
 /// Print the global summary with formatted statistics.
-fn print_global_summary(stats: &GlobalStats) {
+fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<()> {
     let pct = |n: usize, d: usize| -> String {
         if d > 0 {
             format!("{:.1}%", n as f64 / d as f64 * 100.0)
@@ -340,78 +394,89 @@ fn print_global_summary(stats: &GlobalStats) {
         }
     };
 
-    println!();
-    println!("════════════════════════════════════════════════════════════════════════");
-    println!("                          GLOBAL SUMMARY");
-    println!("════════════════════════════════════════════════════════════════════════");
-    println!();
+    writeln!(w)?;
+    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(w, "                          GLOBAL SUMMARY")?;
+    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(w)?;
 
-    println!("  Authorities");
-    println!(
+    writeln!(w, "  Authorities")?;
+    writeln!(
+        w,
         "  ├─ Total (runtime API):          {:>6}",
         stats.total_authorities
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  ├─ With DHT records:             {:>6} ({})",
         stats.with_dht_records,
         pct(stats.with_dht_records, stats.total_authorities)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  ├─ With Peer ID:                 {:>6} ({})",
         stats.with_peer_id,
         pct(stats.with_peer_id, stats.total_authorities)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  └─ Identified (p2p):             {:>6} ({})",
         stats.identified,
         pct(stats.identified, stats.total_authorities)
-    );
-    println!();
+    )?;
+    writeln!(w)?;
 
-    println!("  Addresses");
-    println!(
+    writeln!(w, "  Addresses")?;
+    writeln!(
+        w,
         "  ├─ Total:                        {:>6}",
         stats.total_addresses
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  ├─ Public:                       {:>6} ({})",
         stats.public_addresses,
         pct(stats.public_addresses, stats.total_addresses)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  └─ Private:                      {:>6} ({})",
         stats.private_addresses,
         pct(stats.private_addresses, stats.total_addresses)
-    );
-    println!();
+    )?;
+    writeln!(w)?;
 
-    println!("  Connectivity");
-    println!(
+    writeln!(w, "  Connectivity")?;
+    writeln!(
+        w,
         "  ├─ Reachable authorities (>=1):  {:>6} ({})",
         stats.reachable_authorities,
         pct(stats.reachable_authorities, stats.total_authorities)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  ├─ Fully reachable (all public): {:>6} ({})",
         stats.fully_reachable_authorities,
         pct(stats.fully_reachable_authorities, stats.total_authorities)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  ├─ Public addrs reachable:  {:>6}/{:<6} ({})",
         stats.reachable_public,
         stats.public_addresses,
         pct(stats.reachable_public, stats.public_addresses)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  └─ Public addrs unreachable:{:>6}/{:<6} ({})",
         stats.unreachable_public,
         stats.public_addresses,
         pct(stats.unreachable_public, stats.public_addresses)
-    );
+    )?;
 
     if !stats.agent_versions.is_empty() {
-        println!();
-        println!("  Agent Distribution");
+        writeln!(w)?;
+        writeln!(w, "  Agent Distribution")?;
         let mut versions: Vec<_> = stats.agent_versions.iter().collect();
         versions.sort_by(|a, b| b.1.cmp(a.1));
         let len = versions.len();
@@ -422,11 +487,12 @@ fn print_global_summary(stats: &GlobalStats) {
             } else {
                 version.to_string()
             };
-            println!("  {} {:<42} {:>4}", branch, v, count);
+            writeln!(w, "  {} {:<42} {:>4}", branch, v, count)?;
         }
     }
 
-    println!();
+    writeln!(w)?;
+    Ok(())
 }
 
 /// Entry function for the `authority-check` CLI command.
@@ -443,12 +509,39 @@ pub async fn check_authorities(
     address_format: Option<String>,
     query_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
-    println!("════════════════════════════════════════════════════════════════════════");
-    println!("                         AUTHORITY CHECK");
-    println!("════════════════════════════════════════════════════════════════════════");
-    println!();
-
     let rpc_url = Url::parse(&url)?;
+
+    // Create cache directory and log file.
+    let cache_file = match fs::create_dir_all("cache") {
+        Ok(()) => {
+            let chain = detect_chain_name(&rpc_url)
+                .unwrap_or("unknown")
+                .to_string();
+            let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
+            let path = format!("cache/{}-{}.logs", chain, timestamp);
+            match File::create(&path) {
+                Ok(f) => {
+                    eprintln!("       Logging output to {}", path);
+                    Some(f)
+                }
+                Err(e) => {
+                    eprintln!("       Warning: could not create log file {}: {}", path, e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("       Warning: could not create cache directory: {}", e);
+            None
+        }
+    };
+
+    let mut w = DualWriter::new(cache_file);
+
+    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(w, "                         AUTHORITY CHECK")?;
+    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(w)?;
 
     // Resolve SS58 prefix: use provided format name or fetch from RPC.
     let version = match address_format {
@@ -462,16 +555,16 @@ pub async fn check_authorities(
             v.prefix()
         }
         None => {
-            println!("       No address format provided, fetching from RPC...");
+            writeln!(w, "       No address format provided, fetching from RPC...")?;
             let prefix = fetch_ss58_prefix(rpc_url.clone()).await?;
             let name = ss58_registry::Ss58AddressFormatRegistry::try_from(
                 ss58_registry::Ss58AddressFormat::custom(prefix),
             );
             match name {
-                Ok(registry) => println!("       Address format: {:?} (prefix: {})", registry, prefix),
-                Err(_) => println!("       SS58 prefix: {}", prefix),
+                Ok(registry) => writeln!(w, "       Address format: {:?} (prefix: {})", registry, prefix)?,
+                Err(_) => writeln!(w, "       SS58 prefix: {}", prefix)?,
             }
-            println!();
+            writeln!(w)?;
             prefix
         }
     };
@@ -480,42 +573,54 @@ pub async fn check_authorities(
     let genesis = match genesis {
         Some(g) => g,
         None => {
-            println!("       No genesis hash provided, fetching from RPC...");
+            writeln!(w, "       No genesis hash provided, fetching from RPC...")?;
             let hash = fetch_genesis_hash(rpc_url.clone()).await?;
-            println!("       Genesis hash: 0x{}", hash);
-            println!();
+            writeln!(w, "       Genesis hash: 0x{}", hash)?;
+            writeln!(w)?;
             hash
         }
     };
 
     // Resolve bootnodes: use provided ones, fetch from RPC, and merge with published chainspec.
-    let bootnodes = resolve_bootnodes(&rpc_url, bootnodes).await?;
+    let bootnodes = resolve_bootnodes(&rpc_url, bootnodes, &mut w).await?;
 
     // Phase 1: Fetch authorities from the runtime API.
-    println!("[1/3] Fetching authorities from runtime API...");
+    writeln!(w, "[1/3] Fetching authorities from runtime API...")?;
     let authorities = runtime_api_autorities(rpc_url).await?;
-    println!("       Found {} authorities", authorities.len());
-    println!();
+    writeln!(w, "       Found {} authorities", authorities.len())?;
+    writeln!(w)?;
 
     // Phase 2: DHT Discovery — scrape authority records for addresses and peer IDs.
-    println!(
+    writeln!(
+        w,
         "[2/3] Discovering authority DHT records (timeout: {}s)...",
         timeout.as_secs()
-    );
+    )?;
     let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
     let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
     discovery.set_show_progress(true);
     discovery.discover().await;
 
     let dht_count = discovery.authority_to_details().len();
-    let identified_count = discovery.peer_info().len();
-    println!(
-        "       DHT records: {}/{} | Identified peers: {}",
+    let identified_authorities = authorities
+        .iter()
+        .filter(|auth| {
+            discovery
+                .authority_to_details()
+                .get(*auth)
+                .and_then(|addrs| addrs.iter().find_map(get_peer_id))
+                .map_or(false, |pid| discovery.peer_info().contains_key(&pid))
+        })
+        .count();
+    writeln!(
+        w,
+        "       DHT records: {}/{} | Identified authorities: {}/{}",
         dht_count,
         authorities.len(),
-        identified_count
-    );
-    println!();
+        identified_authorities,
+        authorities.len(),
+    )?;
+    writeln!(w)?;
 
     // Phase 3: TCP connectivity checks on every discovered address.
     let mut pending_checks: Vec<(usize, Multiaddr, bool)> = Vec::new();
@@ -529,15 +634,16 @@ pub async fn check_authorities(
     }
 
     let public_count = pending_checks.iter().filter(|(_, _, p)| *p).count();
-    println!(
+    writeln!(
+        w,
         "[3/3] Checking connectivity ({} addresses, {} public, timeout: {}s/addr)...",
         pending_checks.len(),
         public_count,
         dial_timeout.as_secs()
-    );
+    )?;
 
-    let mut check_results = run_connectivity_checks(pending_checks, dial_timeout).await;
-    println!();
+    let mut check_results = run_connectivity_checks(pending_checks, dial_timeout, &mut w).await;
+    writeln!(w)?;
 
     // Build per-authority results.
     let mut results: Vec<AuthorityResult> = Vec::with_capacity(authorities.len());
@@ -573,12 +679,13 @@ pub async fn check_authorities(
 
     // Print per-authority details.
     for (i, result) in results.iter().enumerate() {
-        print_authority_result(result, i);
+        print_authority_result(&mut w, result, i)?;
     }
 
     // Print global summary.
     let stats = compute_global_stats(&results);
-    print_global_summary(&stats);
+    print_global_summary(&mut w, &stats)?;
 
+    w.flush()?;
     Ok(())
 }

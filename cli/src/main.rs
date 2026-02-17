@@ -240,7 +240,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
             let rpc_url = Url::parse(&opts.url)?;
-            let bootnodes = resolve_bootnodes(&rpc_url, opts.bootnodes).await?;
+            let bootnodes = resolve_bootnodes(&rpc_url, opts.bootnodes, &mut std::io::stdout()).await?;
             discover_authorities(
                 opts.url,
                 opts.genesis,
