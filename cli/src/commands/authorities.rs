@@ -263,24 +263,39 @@ impl AuthorityDiscovery {
     /// After one query is submitted for every authority this method will
     /// resubmit the DHT queries for the remaining authorities.
     fn advance_dht_queries(&mut self) {
-        // Add more DHT queries.
+        // Add more DHT queries from the initial authority list.
         while self.queries.len() < MAX_QUERIES {
             if let Some(next) = self.authorities.get(self.query_index) {
                 self.query_dht_records(std::iter::once(*next));
                 self.query_index += 1;
             } else {
-                if self.queries.is_empty() {
-                    self.resubmit_remaining_dht_queries();
-                }
-                log::debug!(
-                    "queries: {} remaining authorities to discover {}",
-                    self.queries.len(),
-                    self.remaining_authorities.len()
-                );
-
                 break;
             }
         }
+
+        // Backfill empty slots with remaining (not-yet-found) authorities
+        // so that slots freed by completed queries are reused immediately
+        // instead of waiting for the periodic resubmit timer.
+        if self.query_index >= self.authorities.len() && self.queries.len() < MAX_QUERIES {
+            let in_flight: HashSet<_> = self.queries.values().copied().collect();
+            let backfill: Vec<_> = self
+                .remaining_authorities
+                .iter()
+                .filter(|a| !in_flight.contains(*a))
+                .take(MAX_QUERIES - self.queries.len())
+                .copied()
+                .collect();
+
+            if !backfill.is_empty() {
+                self.query_dht_records(backfill);
+            }
+        }
+
+        log::debug!(
+            "queries: {} remaining authorities to discover {}",
+            self.queries.len(),
+            self.remaining_authorities.len()
+        );
 
         self.query_peer_info();
     }
