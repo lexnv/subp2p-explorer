@@ -62,8 +62,10 @@ pub struct AuthorityCheckOpts {
     #[clap(long, short)]
     url: String,
     /// Hex-encoded genesis hash of the chain.
+    ///
+    /// If not provided, the genesis hash is fetched from the RPC endpoint.
     #[clap(long, short)]
-    genesis: String,
+    genesis: Option<String>,
     /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
     ///
     /// If not provided, bootnodes are fetched from the chain spec via the RPC endpoint.

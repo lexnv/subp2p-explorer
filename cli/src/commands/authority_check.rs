@@ -3,7 +3,7 @@
 // see LICENSE for license details.
 
 use crate::commands::authorities::{
-    fetch_bootnodes_from_rpc, runtime_api_autorities, AuthorityDiscovery,
+    fetch_bootnodes_from_rpc, fetch_genesis_hash, runtime_api_autorities, AuthorityDiscovery,
 };
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
@@ -435,7 +435,7 @@ fn print_global_summary(stats: &GlobalStats) {
 /// to each address. Prints per-authority results and global statistics.
 pub async fn check_authorities(
     url: String,
-    genesis: String,
+    genesis: Option<String>,
     bootnodes: Vec<String>,
     timeout: Duration,
     dial_timeout: Duration,
@@ -453,6 +453,18 @@ pub async fn check_authorities(
     println!();
 
     let rpc_url = Url::parse(&url)?;
+
+    // Resolve genesis hash: use provided one or fetch from RPC.
+    let genesis = match genesis {
+        Some(g) => g,
+        None => {
+            println!("       No genesis hash provided, fetching from RPC...");
+            let hash = fetch_genesis_hash(rpc_url.clone()).await?;
+            println!("       Genesis hash: 0x{}", hash);
+            println!();
+            hash
+        }
+    };
 
     // Resolve bootnodes: use provided ones or fetch from the chain spec via RPC.
     let bootnodes = if bootnodes.is_empty() {

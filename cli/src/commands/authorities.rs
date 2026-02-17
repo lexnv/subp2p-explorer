@@ -61,6 +61,21 @@ pub(crate) async fn fetch_bootnodes_from_rpc(
     Ok(bootnodes)
 }
 
+/// Fetch the genesis hash from the RPC endpoint.
+///
+/// Calls `chain_getBlockHash(0)` and returns the hex-encoded hash (without `0x` prefix).
+pub(crate) async fn fetch_genesis_hash(
+    url: Url,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = client(url).await?;
+
+    let hash: String = client
+        .request("chain_getBlockHash", rpc_params![0u32])
+        .await?;
+
+    Ok(hash.trim_start_matches("0x").to_string())
+}
+
 /// Call the runtime API of the target node to retrive the current set
 /// of authorities.
 ///
