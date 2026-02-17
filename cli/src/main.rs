@@ -84,7 +84,7 @@ pub struct AuthorityCheckOpts {
     #[clap(long, short, value_parser = parse_duration)]
     timeout: std::time::Duration,
     /// The number of seconds to wait for each individual TCP connection check.
-    #[clap(long, short = 'd', default_value = "5", value_parser = parse_duration)]
+    #[clap(long, short = 'd', default_value = "10", value_parser = parse_duration)]
     dial_timeout: std::time::Duration,
     /// The address format name of the chain (e.g., "polkadot", "kusama").
     ///

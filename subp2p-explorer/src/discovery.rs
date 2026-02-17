@@ -36,7 +36,7 @@ impl DiscoveryBuilder {
     /// Create a new [`DiscoveryBuilder`].
     pub fn new() -> DiscoveryBuilder {
         DiscoveryBuilder {
-            max_packet_size: 8192,
+            max_packet_size: 16 * 1024 * 1024,
             record_ttl: None,
             provider_ttl: None,
             query_timeout: Duration::from_secs(15),

@@ -65,13 +65,19 @@ pub(crate) async fn fetch_bootnodes_from_rpc(
 /// `https://paritytech.github.io/chainspecs/{chain}/relaychain/chainspec.json`.
 const KNOWN_CHAINS: &[&str] = &["kusama", "paseo", "westend", "polkadot"];
 
-/// Detect a known chain name from the RPC URL hostname.
+/// Detect a known chain name from the RPC URL.
 ///
-/// Checks for "kusama", "paseo", "westend", "polkadot" (in that order — kusama
-/// before polkadot because `kusama-rpc.polkadot.io` contains both).
+/// Checks both the hostname and path for "kusama", "paseo", "westend",
+/// "polkadot" (in that order — kusama before polkadot because
+/// `kusama-rpc.polkadot.io` contains both). This also handles URLs like
+/// `wss://rpc.ibp.network/paseo` where the chain name is in the path.
 pub(crate) fn detect_chain_name(url: &Url) -> Option<&'static str> {
-    let host = url.host_str()?;
-    KNOWN_CHAINS.iter().find(|&&chain| host.contains(chain)).copied()
+    let host = url.host_str().unwrap_or("");
+    let path = url.path();
+    KNOWN_CHAINS
+        .iter()
+        .find(|&&chain| host.contains(chain) || path.contains(chain))
+        .copied()
 }
 
 /// Fetch bootnodes from a published chainspec for a known chain.
@@ -121,12 +127,20 @@ pub(crate) async fn resolve_bootnodes(
         println!("       Detected known chain \"{}\", downloading published chainspec bootnodes...", chain);
         match fetch_bootnodes_from_chainspec(chain).await {
             Ok(extra) => {
-                println!("       Fetched {} bootnodes from published chainspec", extra.len());
+                let unique_peers: HashSet<_> = extra
+                    .iter()
+                    .filter_map(|addr| addr.rsplit("/p2p/").next())
+                    .collect();
+                println!(
+                    "       Fetched from chainspec online {} addresses and {} bootnodes",
+                    extra.len(),
+                    unique_peers.len()
+                );
                 let mut seen: HashSet<String> = bootnodes.drain(..).collect();
                 let before = seen.len();
                 seen.extend(extra);
                 println!(
-                    "       Merged to {} unique bootnodes ({} new from chainspec)",
+                    "       Merged to {} unique addresses ({} new from chainspec)",
                     seen.len(),
                     seen.len() - before
                 );
