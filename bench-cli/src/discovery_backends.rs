@@ -45,7 +45,7 @@ where
                 listen_addresses,
                 ..
             } => {
-                let entry = peers_data.entry(peer).or_insert_with(|| HashSet::new());
+                let entry = peers_data.entry(peer).or_insert_with(HashSet::new);
                 listen_addresses.clone().into_iter().for_each(|address| {
                     entry.insert(address);
                 });
@@ -67,7 +67,7 @@ where
                 for (peer, addresses) in peers {
                     backend.add_known_peer(peer, addresses.clone()).await;
 
-                    let entry = peers_data.entry(peer).or_insert_with(|| HashSet::new());
+                    let entry = peers_data.entry(peer).or_insert_with(HashSet::new);
                     addresses.into_iter().for_each(|address| {
                         entry.insert(address);
                     });
@@ -83,7 +83,7 @@ where
 
         while queries.len() < 50 {
             let query_id = backend
-                .find_node(peer_iter.next().unwrap_or_else(|| PeerId::random()))
+                .find_node(peer_iter.next().unwrap_or_else(PeerId::random))
                 .await;
             queries.insert(query_id, std::time::Instant::now());
             num_queries += 1;

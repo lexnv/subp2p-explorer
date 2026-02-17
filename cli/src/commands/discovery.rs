@@ -7,7 +7,7 @@ use codec::Decode;
 use futures::StreamExt;
 use libp2p::{
     identify::Info,
-    kad::{GetClosestPeersError, GetClosestPeersOk, KademliaEvent, QueryId, QueryResult},
+    kad::{Event as KademliaEvent, GetClosestPeersError, GetClosestPeersOk, QueryId, QueryResult},
     multiaddr::Protocol,
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
@@ -198,7 +198,7 @@ pub async fn discover_network(
     only_authorities: bool,
     timeout: std::time::Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let swarm = build_swarm(genesis.clone(), bootnodes)?;
+    let swarm = build_swarm(genesis.clone(), bootnodes).await?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
 
     // Drive network events for a few minutes.
@@ -297,7 +297,7 @@ pub async fn discover_network(
                 .and_modify(|num| *num += 1)
                 .or_insert(1);
 
-            geolocated_peers.insert(peer.clone(), located);
+            geolocated_peers.insert(*peer, located);
 
             break;
         }

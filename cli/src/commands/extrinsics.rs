@@ -18,7 +18,7 @@ pub async fn submit_extrinsics(
     bootnodes: Vec<String>,
     extrinsics: String,
 ) -> Result<(), Box<dyn Error>> {
-    let mut swarm = build_swarm(genesis, bootnodes)?;
+    let mut swarm = build_swarm(genesis, bootnodes).await?;
     let payload = hex::decode(extrinsics.trim_start_matches("0x"))?;
 
     // Perform the kademlia bootstrap.

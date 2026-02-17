@@ -6,14 +6,14 @@ use futures::StreamExt;
 use libp2p::{
     identify::{self},
     identity,
-    swarm::{SwarmBuilder, SwarmEvent},
+    swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::Duration;
-use subp2p_explorer::{peer_behavior::AGENT, transport::TransportBuilder};
+use subp2p_explorer::peer_behavior::AGENT;
 
 /// Holds the state machine needed to check if the provided
 /// list of peers is reachable and responds to the identify
@@ -45,11 +45,9 @@ impl Bootnodes {
         }
     }
 
-    fn build_swarm() -> Swarm<identify::Behaviour> {
+    async fn build_swarm() -> Swarm<identify::Behaviour> {
         let local_key = identity::Keypair::generate_ed25519();
-        let local_peer_id = PeerId::from(local_key.public());
 
-        let transport = TransportBuilder::new().build(local_key.clone());
         let behavior = identify::Behaviour::new(
             identify::Config::new("/substrate/1.0".to_string(), local_key.public())
                 .with_agent_version(AGENT.to_string())
@@ -57,12 +55,29 @@ impl Bootnodes {
                 .with_cache_size(0),
         );
 
-        SwarmBuilder::with_tokio_executor(transport, behavior, local_peer_id).build()
+        let tcp_config = libp2p::tcp::Config::new().nodelay(true);
+
+        libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp_config,
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .expect("Can construct TCP; qed")
+            .with_dns()
+            .expect("Can construct DNS; qed")
+            .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+            .await
+            .expect("Can construct WebSocket; qed")
+            .with_behaviour(|_key| behavior)
+            .expect("Can construct behaviour; qed")
+            .build()
     }
 
     /// Dial the provided bootnodes and capture the `idenitify::Info` details of each peer.
     pub async fn verify_bootnodes(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut swarm = Self::build_swarm();
+        let mut swarm = Self::build_swarm().await;
 
         for remotes in self.bootnodes.values() {
             for remote in remotes {
@@ -74,20 +89,20 @@ impl Bootnodes {
         while !self.pending_peer_responses.is_empty() {
             if let SwarmEvent::Behaviour(event) = swarm.select_next_some().await {
                 match event {
-                    identify::Event::Received { peer_id, info } => {
+                    identify::Event::Received { peer_id, info, .. } => {
                         // Store the info data to ensure that we validate the protocols supported by the remote peer.
                         self.identify_data.insert(peer_id, info);
 
                         // Peer has responded to identify at least once.
                         self.pending_peer_responses.remove(&peer_id);
                     }
-                    identify::Event::Sent { peer_id } => {
+                    identify::Event::Sent { peer_id, .. } => {
                         println!("Sent identify info to {peer_id:?}");
                     }
-                    identify::Event::Pushed { peer_id } => {
+                    identify::Event::Pushed { peer_id, .. } => {
                         println!("Pushed identify info to {peer_id:?}");
                     }
-                    identify::Event::Error { peer_id, error } => {
+                    identify::Event::Error { peer_id, error, .. } => {
                         println!("Error sending identify info to {peer_id:?}: {error:?}");
                     }
                 }

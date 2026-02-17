@@ -3,7 +3,7 @@
 // see LICENSE for license details.
 
 use codec::Decode;
-use libp2p::kad::record::Key as KademliaKey;
+use libp2p::kad::RecordKey as KademliaKey;
 use libp2p::{Multiaddr, PeerId};
 use multihash_codetable::{Code, MultihashDigest};
 use prost::Message;
@@ -39,7 +39,7 @@ pub fn decode_dht_record(
     // Decode and verify the authority signature.
     let payload = schema::SignedAuthorityRecord::decode(value.as_slice())?;
     let auth_signature = sr25519::Signature::decode(&mut &payload.auth_signature[..])?;
-    if !sr25519::verify(&auth_signature, &payload.record, &authority_id) {
+    if !sr25519::verify(&auth_signature, &payload.record, authority_id) {
         return Err("Cannot verify DHT payload".into());
     }
 
@@ -64,11 +64,10 @@ pub fn decode_dht_record(
         .into());
     }
 
-    let peer_id = peer_ids
+    let peer_id = *peer_ids
         .iter()
         .next()
-        .expect("At least one peerId; qed")
-        .clone();
+        .expect("At least one peerId; qed");
 
     // Verify peer signature.
     let Some(peer_signature) = payload.peer_signature else {
@@ -78,7 +77,7 @@ pub fn decode_dht_record(
     if peer_id != public_key.to_peer_id() {
         return Err("PeerId does not match the public key".into());
     }
-    if !public_key.verify(&payload.record.as_slice(), &peer_signature.signature) {
+    if !public_key.verify(payload.record.as_slice(), &peer_signature.signature) {
         return Err("Peer signature verification failed".into());
     }
 

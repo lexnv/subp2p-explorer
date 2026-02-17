@@ -3,7 +3,7 @@
 // see LICENSE for license details.
 
 use ip_network::IpNetwork;
-use libp2p::{identity, multiaddr::Protocol, swarm::SwarmBuilder, Multiaddr, PeerId, Swarm};
+use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId, Swarm};
 use maxminddb::{geoip2::City, Reader as GeoIpReader};
 use primitive_types::H256;
 use std::error::Error;
@@ -16,7 +16,6 @@ use subp2p_explorer::{
         messages::ProtocolRole,
     },
     peer_behavior::PeerBehaviour,
-    transport::{TransportBuilder, MIB},
     Behaviour,
 };
 
@@ -29,11 +28,17 @@ pub struct Locator {
 #[derive(Debug)]
 pub struct Location {
     pub city: String,
-    pub accuracy_radius: Option<u16>,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub metro_code: Option<u16>,
-    pub time_zone: Option<String>,
+    pub _accuracy_radius: Option<u16>,
+    pub _latitude: Option<f64>,
+    pub _longitude: Option<f64>,
+    pub _metro_code: Option<u16>,
+    pub _time_zone: Option<String>,
+}
+
+impl Default for Locator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Locator {
@@ -60,19 +65,18 @@ impl Locator {
 
         Some(Location {
             city: city.into_string(),
-            accuracy_radius: location.clone().map(|loc: maxminddb::geoip2::city::Location| loc.accuracy_radius).flatten(),
-            latitude: location.clone().map(|loc| loc.latitude).flatten(),
-            longitude: location.clone().map(|loc| loc.longitude).flatten(),
-            metro_code: location.clone().map(|loc| loc.metro_code).flatten(),
-            time_zone: location
-                .map(|loc| loc.time_zone.map(|zone| zone.to_string()))
-                .flatten(),
+            _accuracy_radius: location.clone().and_then(|loc: maxminddb::geoip2::city::Location| loc.accuracy_radius),
+            _latitude: location.clone().and_then(|loc| loc.latitude),
+            _longitude: location.clone().and_then(|loc| loc.longitude),
+            _metro_code: location.clone().and_then(|loc| loc.metro_code),
+            _time_zone: location
+                .and_then(|loc| loc.time_zone.map(|zone| zone.to_string())),
         })
     }
 }
 
 /// Build the swarm for the CLI.
-pub fn build_swarm(
+pub async fn build_swarm(
     genesis: String,
     bootnodes: Vec<String>,
 ) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
@@ -103,29 +107,39 @@ pub fn build_swarm(
         node_role: ProtocolRole::FullNode,
     };
 
-    // Create a Switch (swarm) to manage peers and events.
-    let mut swarm: Swarm<Behaviour> = {
-        let transport = TransportBuilder::new()
-            .yamux_maximum_buffer_size(256 * MIB)
-            .build(local_key.clone());
+    let discovery = DiscoveryBuilder::new()
+        .record_ttl(Some(Duration::from_secs(0)))
+        .provider_ttl(Some(Duration::from_secs(0)))
+        .query_timeout(Duration::from_secs(5 * 60))
+        .build(local_peer_id, genesis);
 
-        let discovery = DiscoveryBuilder::new()
-            .record_ttl(Some(Duration::from_secs(0)))
-            .provider_ttl(Some(Duration::from_secs(0)))
-            .query_timeout(Duration::from_secs(5 * 60))
-            .build(local_peer_id, genesis);
+    let peer_info = PeerBehaviour::new(local_key.public());
+    let notifications = Notifications::new(protocol_data);
 
-        let peer_info = PeerBehaviour::new(local_key.public());
-        let notifications = Notifications::new(protocol_data);
+    let tcp_config = libp2p::tcp::Config::new().nodelay(true);
 
-        let behavior = Behaviour {
-            notifications,
-            peer_info,
-            discovery,
-        };
-
-        SwarmBuilder::with_tokio_executor(transport, behavior, local_peer_id).build()
-    };
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(
+            tcp_config,
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .expect("Can construct TCP; qed")
+        .with_dns()
+        .expect("Can construct DNS; qed")
+        .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+        .await
+        .expect("Can construct WebSocket; qed")
+        .with_behaviour(|_key| {
+            Behaviour {
+                notifications,
+                peer_info,
+                discovery,
+            }
+        })
+        .expect("Can construct behaviour; qed")
+        .build();
 
     // Active set of peers from the kbuckets of kademlia.
     // These are the initial peers for which the queries are performed against.

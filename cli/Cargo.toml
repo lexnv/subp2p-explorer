@@ -32,7 +32,7 @@ asynchronous-codec = { workspace = true }
 unsigned-varint = { workspace = true, features = ["futures", "asynchronous_codec"] }
 thiserror = { workspace = true }
 bytes = { workspace = true }
-codec = { package = "parity-scale-codec", workspace = true, features = ["derive"] }
+codec = { workspace = true }
 primitive-types = { workspace = true, default-features = false, features = ["codec", "scale-info", "serde"] }
 serde_json = { workspace = true }
 serde = {workspace = true }

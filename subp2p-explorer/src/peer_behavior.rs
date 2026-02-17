@@ -10,7 +10,7 @@ use std::{
 use either::Either;
 use fnv::FnvHashMap;
 use libp2p::{
-    core::{ConnectedPoint, Endpoint},
+    core::{transport::PortUse, ConnectedPoint, Endpoint},
     identify::{
         Behaviour as Identify, Config as IdentifyConfig, Event as IdentifyEvent,
         Info as IdentifyInfo,
@@ -18,12 +18,9 @@ use libp2p::{
     identity::PublicKey,
     ping::{Behaviour as Ping, Config as PingConfig},
     swarm::{
-        behaviour::{
-            AddressChange, ConnectionClosed, ConnectionEstablished, DialFailure, FromSwarm,
-            ListenFailure,
-        },
+        behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm},
         ConnectionDenied, ConnectionHandler, ConnectionHandlerSelect, ConnectionId,
-        NetworkBehaviour, PollParameters, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+        NetworkBehaviour, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
@@ -163,164 +160,56 @@ impl NetworkBehaviour for PeerBehaviour {
         peer: PeerId,
         addr: &Multiaddr,
         role_override: Endpoint,
+        port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         let ping_handler = self.ping.handle_established_outbound_connection(
             connection_id,
             peer,
             addr,
             role_override,
+            port_use,
         )?;
         let identify_handler = self.identify.handle_established_outbound_connection(
             connection_id,
             peer,
             addr,
             role_override,
+            port_use,
         )?;
         Ok(ping_handler.select(identify_handler))
     }
 
-    fn on_swarm_event(&mut self, event: FromSwarm<Self::ConnectionHandler>) {
-        match event {
-            FromSwarm::ConnectionEstablished(
-                e @ ConnectionEstablished {
-                    peer_id, endpoint, ..
-                },
-            ) => {
-                self.ping
-                    .on_swarm_event(FromSwarm::ConnectionEstablished(e));
-                self.identify
-                    .on_swarm_event(FromSwarm::ConnectionEstablished(e));
-
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        match &event {
+            FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id, endpoint, ..
+            }) => {
+                let endpoint = (*endpoint).clone();
                 self.details
-                    .entry(peer_id)
+                    .entry(*peer_id)
                     .and_modify(|details| {
                         details.connections.push(endpoint.clone());
                     })
-                    .or_insert_with(|| NodeDetails::new(endpoint.clone()));
+                    .or_insert_with(|| NodeDetails::new(endpoint));
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
-                peer_id,
-                connection_id,
-                endpoint,
-                handler,
-                remaining_established,
+                peer_id, endpoint, ..
             }) => {
-                let (ping_handler, identity_handler) = handler.into_inner();
-                self.ping
-                    .on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
-                        peer_id,
-                        connection_id,
-                        endpoint,
-                        handler: ping_handler,
-                        remaining_established,
-                    }));
-                self.identify
-                    .on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
-                        peer_id,
-                        connection_id,
-                        endpoint,
-                        handler: identity_handler,
-                        remaining_established,
-                    }));
-
-                if let Some(node) = self.details.get_mut(&peer_id) {
-                    node.connections.retain(|conn| conn != endpoint)
+                if let Some(node) = self.details.get_mut(peer_id) {
+                    node.connections.retain(|conn| conn != *endpoint)
                 }
             }
-            FromSwarm::DialFailure(DialFailure {
-                peer_id,
-                error,
-                connection_id,
-            }) => {
-                self.ping
-                    .on_swarm_event(FromSwarm::DialFailure(DialFailure {
-                        peer_id,
-                        error,
-                        connection_id,
-                    }));
-                self.identify
-                    .on_swarm_event(FromSwarm::DialFailure(DialFailure {
-                        peer_id,
-                        error,
-                        connection_id,
-                    }));
-            }
-            FromSwarm::ListenerClosed(e) => {
-                self.ping.on_swarm_event(FromSwarm::ListenerClosed(e));
-                self.identify.on_swarm_event(FromSwarm::ListenerClosed(e));
-            }
-            FromSwarm::ListenFailure(ListenFailure {
-                local_addr,
-                send_back_addr,
-                error,
-                connection_id,
-            }) => {
-                self.ping
-                    .on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
-                        local_addr,
-                        send_back_addr,
-                        error,
-                        connection_id,
-                    }));
-                self.identify
-                    .on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
-                        local_addr,
-                        send_back_addr,
-                        error,
-                        connection_id,
-                    }));
-            }
-            FromSwarm::ListenerError(e) => {
-                self.ping.on_swarm_event(FromSwarm::ListenerError(e));
-                self.identify.on_swarm_event(FromSwarm::ListenerError(e));
-            }
-            FromSwarm::NewListener(e) => {
-                self.ping.on_swarm_event(FromSwarm::NewListener(e));
-                self.identify.on_swarm_event(FromSwarm::NewListener(e));
-            }
-            FromSwarm::ExpiredListenAddr(e) => {
-                self.ping.on_swarm_event(FromSwarm::ExpiredListenAddr(e));
-                self.identify
-                    .on_swarm_event(FromSwarm::ExpiredListenAddr(e));
-            }
-            FromSwarm::AddressChange(
-                e @ AddressChange {
-                    peer_id, old, new, ..
-                },
-            ) => {
-                self.ping.on_swarm_event(FromSwarm::AddressChange(e));
-                self.identify.on_swarm_event(FromSwarm::AddressChange(e));
-
-                self.details.entry(peer_id).and_modify(|details| {
-                    details
-                        .connections
-                        .iter_mut()
-                        .find(|conn| conn == &old)
-                        .map(|conn| *conn = new.clone());
-                });
-            }
-            FromSwarm::NewListenAddr(e) => {
-                self.ping.on_swarm_event(FromSwarm::NewListenAddr(e));
-                self.identify.on_swarm_event(FromSwarm::NewListenAddr(e));
-            }
-            FromSwarm::NewExternalAddrCandidate(e) => {
-                self.ping
-                    .on_swarm_event(FromSwarm::NewExternalAddrCandidate(e));
-                self.identify
-                    .on_swarm_event(FromSwarm::NewExternalAddrCandidate(e));
-            }
             FromSwarm::ExternalAddrConfirmed(e) => {
-                self.ping
-                    .on_swarm_event(FromSwarm::ExternalAddrConfirmed(e));
-                self.identify
-                    .on_swarm_event(FromSwarm::ExternalAddrConfirmed(e));
-
                 self.external_addresses.insert(e.addr.clone());
             }
             FromSwarm::ExternalAddrExpired(e) => {
                 self.external_addresses.remove(e.addr);
             }
+            _ => {}
         }
+
+        self.ping.on_swarm_event(event);
+        self.identify.on_swarm_event(event);
     }
 
     fn on_connection_handler_event(
@@ -344,10 +233,9 @@ impl NetworkBehaviour for PeerBehaviour {
     fn poll(
         &mut self,
         cx: &mut Context,
-        params: &mut impl PollParameters,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         loop {
-            match self.ping.poll(cx, params) {
+            match self.ping.poll(cx) {
                 Poll::Pending => break,
                 Poll::Ready(ToSwarm::GenerateEvent(ev)) => {
                     log::debug!(target: LOG_TARGET,
@@ -393,11 +281,12 @@ impl NetworkBehaviour for PeerBehaviour {
                 Poll::Ready(ToSwarm::NewExternalAddrCandidate(address)) => {
                     return Poll::Ready(ToSwarm::NewExternalAddrCandidate(address))
                 }
+                Poll::Ready(_) => {}
             }
         }
 
         loop {
-            match self.identify.poll(cx, params) {
+            match self.identify.poll(cx) {
                 Poll::Pending => break,
                 Poll::Ready(ToSwarm::GenerateEvent(event)) => match event {
                     IdentifyEvent::Received { peer_id, info, .. } => {
@@ -414,7 +303,7 @@ impl NetworkBehaviour for PeerBehaviour {
                         let event = PeerInfoEvent::Identified { peer_id, info };
                         return Poll::Ready(ToSwarm::GenerateEvent(event));
                     }
-                    IdentifyEvent::Error { peer_id, error } => {
+                    IdentifyEvent::Error { peer_id, error, .. } => {
                         log::debug!(target: LOG_TARGET, "Identification with peer={:?} error={}", peer_id, error)
                     }
                     IdentifyEvent::Pushed { .. } => {}
@@ -456,6 +345,7 @@ impl NetworkBehaviour for PeerBehaviour {
                         connection,
                     })
                 }
+                Poll::Ready(_) => {}
             }
         }
 

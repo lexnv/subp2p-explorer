@@ -2,7 +2,9 @@
 // This file is dual-licensed as Apache-2.0 or GPL-3.0.
 // see LICENSE for license details.
 
-use crate::commands::authorities::{fetch_bootnodes_from_rpc, runtime_api_autorities, AuthorityDiscovery};
+use crate::commands::authorities::{
+    fetch_bootnodes_from_rpc, runtime_api_autorities, AuthorityDiscovery,
+};
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
@@ -108,31 +110,28 @@ async fn run_connectivity_checks(
     let start = Instant::now();
 
     let results: Vec<(usize, AddressCheck)> = futures::stream::iter(checks)
-        .map(|(idx, addr, is_public)| {
-            let dial_timeout = dial_timeout;
-            async move {
-                let address_short = shorten_address(&addr);
+        .map(|(idx, addr, is_public)| async move {
+            let address_short = shorten_address(&addr);
 
-                let result = if !is_public {
-                    AddressResult::Skipped("private".into())
-                } else if let Some(endpoint) = extract_tcp_endpoint(&addr) {
-                    match check_tcp_reachable(&endpoint, dial_timeout).await {
-                        Ok(()) => AddressResult::Ok,
-                        Err(e) => AddressResult::Failed(e),
-                    }
-                } else {
-                    AddressResult::Skipped("unsupported transport".into())
-                };
+            let result = if !is_public {
+                AddressResult::Skipped("private".into())
+            } else if let Some(endpoint) = extract_tcp_endpoint(&addr) {
+                match check_tcp_reachable(&endpoint, dial_timeout).await {
+                    Ok(()) => AddressResult::Ok,
+                    Err(e) => AddressResult::Failed(e),
+                }
+            } else {
+                AddressResult::Skipped("unsupported transport".into())
+            };
 
-                (
-                    idx,
-                    AddressCheck {
-                        address_short,
-                        is_public,
-                        result,
-                    },
-                )
-            }
+            (
+                idx,
+                AddressCheck {
+                    address_short,
+                    is_public,
+                    result,
+                },
+            )
         })
         .buffer_unordered(MAX_PARALLEL_CHECKS)
         .collect()
@@ -477,7 +476,7 @@ pub async fn check_authorities(
         "[2/3] Discovering authority DHT records (timeout: {}s)...",
         timeout.as_secs()
     );
-    let swarm = build_swarm(genesis, bootnodes)?;
+    let swarm = build_swarm(genesis, bootnodes).await?;
     let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
     discovery.set_show_progress(true);
     discovery.discover().await;
@@ -531,7 +530,7 @@ pub async fn check_authorities(
             continue;
         };
 
-        let peer_id = addrs.iter().find_map(|a| get_peer_id(a));
+        let peer_id = addrs.iter().find_map(get_peer_id);
         let agent_version = peer_id
             .and_then(|pid| discovery.peer_info().get(&pid))
             .map(|info| info.agent_version.clone());
