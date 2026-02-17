@@ -7,8 +7,8 @@ mod utils;
 
 use clap::Parser as ClapParser;
 use commands::{
-    authorities::discover_authorities, bootnodes::verify_bootnodes, discovery::discover_network,
-    extrinsics::submit_extrinsics,
+    authorities::discover_authorities, authority_check::check_authorities,
+    bootnodes::verify_bootnodes, discovery::discover_network, extrinsics::submit_extrinsics,
 };
 use std::{error::Error, io::Read, path::PathBuf};
 
@@ -16,6 +16,7 @@ use std::{error::Error, io::Read, path::PathBuf};
 #[derive(Debug, ClapParser)]
 enum Command {
     Authorities(Authorities),
+    AuthorityCheck(AuthorityCheckOpts),
     SendExtrinisic(SendExtrinisicOpts),
     DiscoverNetwork(DiscoverNetworkOpts),
     VerifyBootnodes(BootnodesOpts),
@@ -51,6 +52,32 @@ pub struct Authorities {
     /// Print the raw identity list of discovered peers.
     #[clap(long, short)]
     raw_output: bool,
+}
+
+/// Check authority health: discover DHT records, test connectivity per address,
+/// and report per-authority and global statistics.
+#[derive(Debug, ClapParser)]
+pub struct AuthorityCheckOpts {
+    /// The URL of the chain RPC endpoint.
+    #[clap(long, short)]
+    url: String,
+    /// Hex-encoded genesis hash of the chain.
+    #[clap(long, short)]
+    genesis: String,
+    /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
+    ///
+    /// If not provided, bootnodes are fetched from the chain spec via the RPC endpoint.
+    #[clap(long, use_value_delimiter = true, value_parser)]
+    bootnodes: Vec<String>,
+    /// The number of seconds for DHT discovery.
+    #[clap(long, short, value_parser = parse_duration)]
+    timeout: std::time::Duration,
+    /// The number of seconds to wait for each individual TCP connection check.
+    #[clap(long, short = 'd', default_value = "5", value_parser = parse_duration)]
+    dial_timeout: std::time::Duration,
+    /// The address format name of the chain (e.g., "polkadot", "kusama").
+    #[clap(long, short)]
+    address_format: String,
 }
 
 /// Send extrinsic on the p2p network.
@@ -196,7 +223,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.address_format,
                 opts.raw_output,
             )
-            .await.map(|_|())
+            .await
+            .map(|_| ())
+        }
+        Command::AuthorityCheck(opts) => {
+            check_authorities(
+                opts.url,
+                opts.genesis,
+                opts.bootnodes,
+                opts.timeout,
+                opts.dial_timeout,
+                opts.address_format,
+            )
+            .await
         }
     }
 }

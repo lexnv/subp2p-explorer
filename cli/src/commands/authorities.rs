@@ -20,6 +20,7 @@ use rand::{seq::SliceRandom, thread_rng};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use subp2p_explorer::{
     peer_behavior::PeerInfoEvent,
     transport::{TransportBuilder, MIB},
@@ -39,11 +40,36 @@ pub async fn client(url: Url) -> Result<Client, Box<dyn std::error::Error>> {
         .build_with_tokio(sender, receiver))
 }
 
+/// Fetch bootnodes from the chain spec via the RPC endpoint.
+///
+/// Calls `sync_state_genSyncSpec` to retrieve the full chain spec and extracts
+/// the `bootNodes` array.
+pub(crate) async fn fetch_bootnodes_from_rpc(
+    url: Url,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let client = client(url).await?;
+
+    let spec: serde_json::Value = client
+        .request("sync_state_genSyncSpec", rpc_params![true])
+        .await?;
+
+    let bootnodes = spec
+        .get("bootNodes")
+        .ok_or("Chain spec missing `bootNodes` field")?
+        .as_array()
+        .ok_or("Invalid `bootNodes` format, expected array")?
+        .iter()
+        .filter_map(|node| node.as_str().map(|s| s.to_string()))
+        .collect();
+
+    Ok(bootnodes)
+}
+
 /// Call the runtime API of the target node to retrive the current set
 /// of authorities.
 ///
 /// This method calls into `AuthorityDiscoveryApi_authorities` runtime API.
-async fn runtime_api_autorities(
+pub(crate) async fn runtime_api_autorities(
     url: Url,
 ) -> Result<Vec<sr25519::PublicKey>, Box<dyn std::error::Error>> {
     let client = client(url).await?;
@@ -105,6 +131,13 @@ pub struct AuthorityDiscovery {
     interval_resubmit: tokio::time::Interval,
     /// Interval at which to bail out.
     interval_exit: tokio::time::Interval,
+
+    /// Whether to print an interactive progress bar to stdout.
+    show_progress: bool,
+    /// When the discovery process started.
+    start_time: std::time::Instant,
+    /// Timeout duration for display purposes.
+    timeout_secs: u64,
 }
 
 /// The peer details extracted from the DHT.
@@ -155,6 +188,10 @@ impl AuthorityDiscovery {
             old_log: std::time::Instant::now(),
             interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(60)),
             interval_exit: tokio::time::interval(timeout),
+
+            show_progress: false,
+            start_time: std::time::Instant::now(),
+            timeout_secs: timeout.as_secs(),
         }
     }
 
@@ -454,13 +491,61 @@ impl AuthorityDiscovery {
         }
     }
 
+    /// Enable or disable interactive progress bar output on stdout.
+    pub fn set_show_progress(&mut self, show: bool) {
+        self.show_progress = show;
+    }
+
+    /// Print an in-place progress bar to stdout.
+    fn print_progress(&self) {
+        let elapsed = self.start_time.elapsed().as_secs();
+        let total = self.authorities.len();
+        let found = self.authority_to_details.len();
+        let identified = self
+            .peer_details
+            .keys()
+            .filter(|peer| self.peer_info.contains_key(peer))
+            .count();
+
+        let pct = if total > 0 {
+            found as f64 / total as f64
+        } else {
+            0.0
+        };
+        let bar_width = 25;
+        let filled = (pct * bar_width as f64) as usize;
+        let bar = format!(
+            "{}{}",
+            "\u{2588}".repeat(filled),
+            "\u{2591}".repeat(bar_width - filled)
+        );
+
+        print!(
+            "\r       [{}] {}/{} ({:.1}%) | Identified: {} | Errors: {} | {}s/{}s   ",
+            bar,
+            found,
+            total,
+            pct * 100.0,
+            identified,
+            self.dht_errors,
+            elapsed,
+            self.timeout_secs,
+        );
+        let _ = std::io::stdout().flush();
+    }
+
     /// Run the discovery process.
     pub async fn discover(&mut self) {
         self.advance_dht_queries();
+        self.start_time = std::time::Instant::now();
 
         // Should return immediately.
         self.interval_resubmit.tick().await;
         self.interval_exit.tick().await;
+
+        let mut progress_interval =
+            tokio::time::interval(std::time::Duration::from_secs(1));
+        progress_interval.tick().await;
 
         loop {
             futures::select! {
@@ -472,7 +557,19 @@ impl AuthorityDiscovery {
                     self.resubmit_remaining_dht_queries();
                 }
 
+                _ = progress_interval.tick().fuse() => {
+                    if self.show_progress {
+                        self.print_progress();
+                    }
+                }
+
                 _ = self.interval_exit.tick().fuse() => {
+                    if self.show_progress {
+                        // Clear the progress line.
+                        print!("\r{}\r", " ".repeat(100));
+                        let _ = std::io::stdout().flush();
+                    }
+
                     if self.authority_to_details.len() == self.authorities.len() {
                         log::info!("All authorities discovered from DHT");
                     } else {
