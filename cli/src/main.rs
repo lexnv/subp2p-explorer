@@ -52,6 +52,11 @@ pub struct Authorities {
     /// Print the raw identity list of discovered peers.
     #[clap(long, short)]
     raw_output: bool,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
 }
 
 /// Check authority health: discover DHT records, test connectivity per address,
@@ -82,6 +87,11 @@ pub struct AuthorityCheckOpts {
     /// If not provided, the SS58 prefix is fetched from the RPC endpoint.
     #[clap(long, short)]
     address_format: Option<String>,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
 }
 
 /// Send extrinsic on the p2p network.
@@ -127,6 +137,11 @@ pub struct DiscoverNetworkOpts {
     /// The number of seconds the discovery process should run for.
     #[clap(long, short, value_parser = parse_duration)]
     timeout: std::time::Duration,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -214,6 +229,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.raw_geolocation,
                 opts.only_authorities,
                 opts.timeout,
+                opts.query_timeout,
             )
             .await
         }
@@ -226,6 +242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.timeout,
                 opts.address_format,
                 opts.raw_output,
+                opts.query_timeout,
             )
             .await
             .map(|_| ())
@@ -238,6 +255,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.timeout,
                 opts.dial_timeout,
                 opts.address_format,
+                opts.query_timeout,
             )
             .await
         }

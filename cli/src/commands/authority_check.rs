@@ -441,6 +441,7 @@ pub async fn check_authorities(
     timeout: Duration,
     dial_timeout: Duration,
     address_format: Option<String>,
+    query_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     println!("════════════════════════════════════════════════════════════════════════");
     println!("                         AUTHORITY CHECK");
@@ -509,7 +510,7 @@ pub async fn check_authorities(
         "[2/3] Discovering authority DHT records (timeout: {}s)...",
         timeout.as_secs()
     );
-    let swarm = build_swarm(genesis, bootnodes).await?;
+    let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
     let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
     discovery.set_show_progress(true);
     discovery.discover().await;

@@ -197,8 +197,9 @@ pub async fn discover_network(
     raw_geolocation: bool,
     only_authorities: bool,
     timeout: std::time::Duration,
+    query_timeout: std::time::Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let swarm = build_swarm(genesis.clone(), bootnodes).await?;
+    let swarm = build_swarm(genesis.clone(), bootnodes, query_timeout).await?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
 
     // Drive network events for a few minutes.

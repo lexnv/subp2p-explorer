@@ -79,6 +79,7 @@ impl Locator {
 pub async fn build_swarm(
     genesis: String,
     bootnodes: Vec<String>,
+    query_timeout: Duration,
 ) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
     // Create a random key for ourselves.
     let local_key = identity::Keypair::generate_ed25519();
@@ -110,7 +111,7 @@ pub async fn build_swarm(
     let discovery = DiscoveryBuilder::new()
         .record_ttl(Some(Duration::from_secs(0)))
         .provider_ttl(Some(Duration::from_secs(0)))
-        .query_timeout(Duration::from_secs(60))
+        .query_timeout(query_timeout)
         .build(local_peer_id, genesis);
 
     let peer_info = PeerBehaviour::new(local_key.public());

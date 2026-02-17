@@ -39,7 +39,7 @@ impl DiscoveryBuilder {
             max_packet_size: 8192,
             record_ttl: None,
             provider_ttl: None,
-            query_timeout: Duration::from_secs(60),
+            query_timeout: Duration::from_secs(15),
         }
     }
 
@@ -65,7 +65,7 @@ impl DiscoveryBuilder {
 
     /// Sets the timeout for a single query.
     ///
-    /// Default: 60 seconds.
+    /// Default: 15 seconds.
     pub fn query_timeout(mut self, query_timeout: Duration) -> Self {
         self.query_timeout = query_timeout;
         self

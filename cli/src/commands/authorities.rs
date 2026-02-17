@@ -721,6 +721,7 @@ pub async fn discover_authorities(
     timeout: std::time::Duration,
     address_format: String,
     raw_output: bool,
+    query_timeout: std::time::Duration,
 ) -> Result<(AuthorityDiscovery, Vec<sr25519::PublicKey>), Box<dyn std::error::Error>> {
     let format_registry =
         ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
@@ -741,7 +742,7 @@ pub async fn discover_authorities(
     // Perform DHT queries to find the authorities on the network.
     // Then, record the addresses of the authorities and the responses
     // from the identify protocol.
-    let swarm = build_swarm(genesis.clone(), bootnodes).await?;
+    let swarm = build_swarm(genesis.clone(), bootnodes, query_timeout).await?;
     let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
     authority_discovery.discover().await;
     log::info!("Finished discovery\n");
