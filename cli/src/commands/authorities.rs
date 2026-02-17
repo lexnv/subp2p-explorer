@@ -252,6 +252,8 @@ impl AuthorityDiscovery {
         match event {
             // Discovery DHT record.
             SwarmEvent::Behaviour(behavior_event) => {
+                log::info!("Behaviour event: {:?}", behavior_event);
+
                 match behavior_event {
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
                         id,
@@ -375,6 +377,77 @@ impl AuthorityDiscovery {
                     }
                     _ => (),
                 }
+            }
+
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                cause,
+            } => {
+                log::info!(
+                    "Connection closed: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    num_established,
+                );
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                concurrent_dial_errors,
+                established_in,
+            } => {
+                log::info!(
+                    "Connection established: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    num_established,
+                );
+            }
+
+            SwarmEvent::Dialing {
+                peer_id,
+                connection_id,
+            } => {
+                log::info!(
+                    "Dialing: peer_id={:?} connection_id={:?}",
+                    peer_id,
+                    connection_id,
+                );
+            }
+
+            SwarmEvent::OutgoingConnectionError {
+                connection_id,
+                peer_id,
+                error,
+            } => {
+                log::info!(
+                    "Outgoing connection error: peer_id={:?} connection_id={:?} error={:?}",
+                    peer_id,
+                    connection_id,
+                    error,
+                );
+            }
+
+            SwarmEvent::IncomingConnectionError {
+                connection_id,
+                local_addr,
+                send_back_addr,
+                error,
+            } => {
+                log::info!(
+                    "Incoming connection error: connection_id={:?} local_addr={:?} send_back_addr={:?} error={:?}",
+                    connection_id,
+                    local_addr,
+                    send_back_addr,
+                    error,
+                );
             }
 
             _ => (),
