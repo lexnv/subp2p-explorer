@@ -110,7 +110,7 @@ pub async fn build_swarm(
     let discovery = DiscoveryBuilder::new()
         .record_ttl(Some(Duration::from_secs(0)))
         .provider_ttl(Some(Duration::from_secs(0)))
-        .query_timeout(Duration::from_secs(5 * 60))
+        .query_timeout(Duration::from_secs(60))
         .build(local_peer_id, genesis);
 
     let peer_info = PeerBehaviour::new(local_key.public());

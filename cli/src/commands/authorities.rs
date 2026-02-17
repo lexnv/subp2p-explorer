@@ -118,7 +118,7 @@ pub(crate) async fn runtime_api_autorities(
 }
 
 /// The maximum number of Kademlia `get-records` queried a time.
-const MAX_QUERIES: usize = 8;
+const MAX_QUERIES: usize = 64;
 
 /// Discover the authorities on the network.
 pub struct AuthorityDiscovery {
@@ -214,7 +214,7 @@ impl AuthorityDiscovery {
             finished_query: false,
 
             old_log: std::time::Instant::now(),
-            interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(60)),
+            interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(15)),
             interval_exit: tokio::time::interval(timeout),
 
             show_progress: false,
@@ -317,7 +317,7 @@ impl AuthorityDiscovery {
         match event {
             // Discovery DHT record.
             SwarmEvent::Behaviour(behavior_event) => {
-                log::info!("Behaviour event: {:?}", behavior_event);
+                log::trace!("Behaviour event: {:?}", behavior_event);
 
                 match behavior_event {
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
@@ -333,6 +333,7 @@ impl AuthorityDiscovery {
                             let value = peer_record.record.value;
 
                             let Some(authority) = self.records_keys.get(&key) else {
+                                self.advance_dht_queries();
                                 return;
                             };
                             let authority = *authority;
@@ -346,6 +347,7 @@ impl AuthorityDiscovery {
                                         e
                                     );
                                     self.dht_errors += 1;
+                                    self.advance_dht_queries();
                                     return;
                                 }
                             };
@@ -395,8 +397,19 @@ impl AuthorityDiscovery {
                             }
 
                             self.remaining_authorities.remove(&authority);
-                            self.advance_dht_queries();
+                        } else {
+                            log::debug!(
+                                "DHT query failed: {:?} (in-flight: {}, remaining: {})",
+                                record.err(),
+                                self.queries.len(),
+                                self.remaining_authorities.len()
+                            );
                         }
+
+                        // Always advance queries regardless of success or failure,
+                        // otherwise failed queries reduce concurrency without replacement
+                        // and the discovery stalls until the resubmit timer fires.
+                        self.advance_dht_queries();
                     }
 
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
@@ -543,14 +556,19 @@ impl AuthorityDiscovery {
             "\u{2591}".repeat(bar_width - filled)
         );
 
+        let connected_peers = self.swarm.connected_peers().count();
+        let queries_inflight = self.queries.len();
+
         print!(
-            "\r       [{}] {}/{} ({:.1}%) | Identified: {} | Errors: {} | {}s/{}s   ",
+            "\r       [{}] {}/{} ({:.1}%) | Identified: {} | Errors: {} | Peers: {} | Queries: {} | {}s/{}s   ",
             bar,
             found,
             total,
             pct * 100.0,
             identified,
             self.dht_errors,
+            connected_peers,
+            queries_inflight,
             elapsed,
             self.timeout_secs,
         );
