@@ -3,7 +3,8 @@
 // see LICENSE for license details.
 
 use crate::commands::authorities::{
-    fetch_bootnodes_from_rpc, fetch_genesis_hash, runtime_api_autorities, AuthorityDiscovery,
+    fetch_bootnodes_from_rpc, fetch_genesis_hash, fetch_ss58_prefix, runtime_api_autorities,
+    AuthorityDiscovery,
 };
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
@@ -439,20 +440,40 @@ pub async fn check_authorities(
     bootnodes: Vec<String>,
     timeout: Duration,
     dial_timeout: Duration,
-    address_format: String,
+    address_format: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    let format_registry =
-        ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
-            .map_err(|err| format!("Cannot parse the provided address format: {:?}", err))?;
-    let version: ss58_registry::Ss58AddressFormat = format_registry.into();
-    let version = version.prefix();
-
     println!("════════════════════════════════════════════════════════════════════════");
     println!("                         AUTHORITY CHECK");
     println!("════════════════════════════════════════════════════════════════════════");
     println!();
 
     let rpc_url = Url::parse(&url)?;
+
+    // Resolve SS58 prefix: use provided format name or fetch from RPC.
+    let version = match address_format {
+        Some(fmt) => {
+            let format_registry =
+                ss58_registry::Ss58AddressFormatRegistry::try_from(fmt.as_str())
+                    .map_err(|err| {
+                        format!("Cannot parse the provided address format: {:?}", err)
+                    })?;
+            let v: ss58_registry::Ss58AddressFormat = format_registry.into();
+            v.prefix()
+        }
+        None => {
+            println!("       No address format provided, fetching from RPC...");
+            let prefix = fetch_ss58_prefix(rpc_url.clone()).await?;
+            let name = ss58_registry::Ss58AddressFormatRegistry::try_from(
+                ss58_registry::Ss58AddressFormat::custom(prefix),
+            );
+            match name {
+                Ok(registry) => println!("       Address format: {:?} (prefix: {})", registry, prefix),
+                Err(_) => println!("       SS58 prefix: {}", prefix),
+            }
+            println!();
+            prefix
+        }
+    };
 
     // Resolve genesis hash: use provided one or fetch from RPC.
     let genesis = match genesis {

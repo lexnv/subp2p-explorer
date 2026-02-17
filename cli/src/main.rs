@@ -78,8 +78,10 @@ pub struct AuthorityCheckOpts {
     #[clap(long, short = 'd', default_value = "5", value_parser = parse_duration)]
     dial_timeout: std::time::Duration,
     /// The address format name of the chain (e.g., "polkadot", "kusama").
+    ///
+    /// If not provided, the SS58 prefix is fetched from the RPC endpoint.
     #[clap(long, short)]
-    address_format: String,
+    address_format: Option<String>,
 }
 
 /// Send extrinsic on the p2p network.

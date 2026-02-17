@@ -64,9 +64,7 @@ pub(crate) async fn fetch_bootnodes_from_rpc(
 /// Fetch the genesis hash from the RPC endpoint.
 ///
 /// Calls `chain_getBlockHash(0)` and returns the hex-encoded hash (without `0x` prefix).
-pub(crate) async fn fetch_genesis_hash(
-    url: Url,
-) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) async fn fetch_genesis_hash(url: Url) -> Result<String, Box<dyn std::error::Error>> {
     let client = client(url).await?;
 
     let hash: String = client
@@ -74,6 +72,23 @@ pub(crate) async fn fetch_genesis_hash(
         .await?;
 
     Ok(hash.trim_start_matches("0x").to_string())
+}
+
+/// Fetch the SS58 address prefix from the RPC endpoint via `system_properties`.
+pub(crate) async fn fetch_ss58_prefix(url: Url) -> Result<u16, Box<dyn std::error::Error>> {
+    let client = client(url).await?;
+
+    let props: serde_json::Value = client
+        .request("system_properties", rpc_params![])
+        .await?;
+
+    let prefix = props
+        .get("ss58Format")
+        .ok_or("system_properties missing `ss58Format` field")?
+        .as_u64()
+        .ok_or("Invalid `ss58Format`, expected integer")? as u16;
+
+    Ok(prefix)
 }
 
 /// Call the runtime API of the target node to retrive the current set
@@ -431,7 +446,7 @@ impl AuthorityDiscovery {
                 num_established,
                 ..
             } => {
-                log::info!(
+                log::trace!(
                     "Connection closed: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
                     peer_id,
                     connection_id,
@@ -446,7 +461,7 @@ impl AuthorityDiscovery {
                 num_established,
                 ..
             } => {
-                log::info!(
+                log::trace!(
                     "Connection established: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
                     peer_id,
                     connection_id,
@@ -459,7 +474,7 @@ impl AuthorityDiscovery {
                 peer_id,
                 connection_id,
             } => {
-                log::info!(
+                log::trace!(
                     "Dialing: peer_id={:?} connection_id={:?}",
                     peer_id,
                     connection_id,
@@ -471,7 +486,7 @@ impl AuthorityDiscovery {
                 peer_id,
                 error,
             } => {
-                log::info!(
+                log::trace!(
                     "Outgoing connection error: peer_id={:?} connection_id={:?} error={:?}",
                     peer_id,
                     connection_id,
@@ -486,7 +501,7 @@ impl AuthorityDiscovery {
                 error,
                 ..
             } => {
-                log::info!(
+                log::trace!(
                     "Incoming connection error: connection_id={:?} local_addr={:?} send_back_addr={:?} error={:?}",
                     connection_id,
                     local_addr,
