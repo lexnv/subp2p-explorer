@@ -61,6 +61,88 @@ pub(crate) async fn fetch_bootnodes_from_rpc(
     Ok(bootnodes)
 }
 
+/// Known chains whose published chainspecs are available at
+/// `https://paritytech.github.io/chainspecs/{chain}/relaychain/chainspec.json`.
+const KNOWN_CHAINS: &[&str] = &["kusama", "paseo", "westend", "polkadot"];
+
+/// Detect a known chain name from the RPC URL hostname.
+///
+/// Checks for "kusama", "paseo", "westend", "polkadot" (in that order — kusama
+/// before polkadot because `kusama-rpc.polkadot.io` contains both).
+pub(crate) fn detect_chain_name(url: &Url) -> Option<&'static str> {
+    let host = url.host_str()?;
+    KNOWN_CHAINS.iter().find(|&&chain| host.contains(chain)).copied()
+}
+
+/// Fetch bootnodes from a published chainspec for a known chain.
+///
+/// Downloads `https://paritytech.github.io/chainspecs/{chain}/relaychain/chainspec.json`
+/// and extracts the `bootNodes` array.
+pub(crate) async fn fetch_bootnodes_from_chainspec(
+    chain: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://paritytech.github.io/chainspecs/{}/relaychain/chainspec.json",
+        chain
+    );
+    let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
+    let bootnodes = resp
+        .get("bootNodes")
+        .ok_or("Published chainspec missing `bootNodes` field")?
+        .as_array()
+        .ok_or("Invalid `bootNodes` format, expected array")?
+        .iter()
+        .filter_map(|node| node.as_str().map(|s| s.to_string()))
+        .collect();
+    Ok(bootnodes)
+}
+
+/// Resolve bootnodes by combining CLI-provided, RPC-fetched, and published chainspec sources.
+///
+/// 1. Uses CLI bootnodes if provided, otherwise fetches from RPC.
+/// 2. If a known chain is detected from the RPC URL, also downloads published chainspec bootnodes.
+/// 3. Merges and deduplicates all bootnodes (exact string match).
+///
+/// Chainspec download failures are logged as warnings and do not abort the process.
+pub(crate) async fn resolve_bootnodes(
+    rpc_url: &Url,
+    cli_bootnodes: Vec<String>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut bootnodes = if cli_bootnodes.is_empty() {
+        println!("       No bootnodes provided, fetching from chain spec via RPC...");
+        let fetched = fetch_bootnodes_from_rpc(rpc_url.clone()).await?;
+        println!("       Fetched {} bootnodes from RPC", fetched.len());
+        fetched
+    } else {
+        cli_bootnodes
+    };
+
+    if let Some(chain) = detect_chain_name(rpc_url) {
+        println!("       Detected known chain \"{}\", downloading published chainspec bootnodes...", chain);
+        match fetch_bootnodes_from_chainspec(chain).await {
+            Ok(extra) => {
+                println!("       Fetched {} bootnodes from published chainspec", extra.len());
+                let mut seen: HashSet<String> = bootnodes.drain(..).collect();
+                let before = seen.len();
+                seen.extend(extra);
+                println!(
+                    "       Merged to {} unique bootnodes ({} new from chainspec)",
+                    seen.len(),
+                    seen.len() - before
+                );
+                bootnodes = seen.into_iter().collect();
+            }
+            Err(e) => {
+                log::warn!("Failed to fetch published chainspec bootnodes for {}: {}", chain, e);
+                println!("       Warning: could not fetch published chainspec bootnodes: {}", e);
+            }
+        }
+    }
+
+    println!();
+    Ok(bootnodes)
+}
+
 /// Fetch the genesis hash from the RPC endpoint.
 ///
 /// Calls `chain_getBlockHash(0)` and returns the hex-encoded hash (without `0x` prefix).

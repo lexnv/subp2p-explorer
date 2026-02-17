@@ -3,7 +3,7 @@
 // see LICENSE for license details.
 
 use crate::commands::authorities::{
-    fetch_bootnodes_from_rpc, fetch_genesis_hash, fetch_ss58_prefix, runtime_api_autorities,
+    fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes, runtime_api_autorities,
     AuthorityDiscovery,
 };
 use crate::utils::{build_swarm, is_public_address};
@@ -488,16 +488,8 @@ pub async fn check_authorities(
         }
     };
 
-    // Resolve bootnodes: use provided ones or fetch from the chain spec via RPC.
-    let bootnodes = if bootnodes.is_empty() {
-        println!("       No bootnodes provided, fetching from chain spec via RPC...");
-        let fetched = fetch_bootnodes_from_rpc(rpc_url.clone()).await?;
-        println!("       Fetched {} bootnodes from chain spec", fetched.len());
-        println!();
-        fetched
-    } else {
-        bootnodes
-    };
+    // Resolve bootnodes: use provided ones, fetch from RPC, and merge with published chainspec.
+    let bootnodes = resolve_bootnodes(&rpc_url, bootnodes).await?;
 
     // Phase 1: Fetch authorities from the runtime API.
     println!("[1/3] Fetching authorities from runtime API...");

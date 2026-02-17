@@ -7,9 +7,13 @@ mod utils;
 
 use clap::Parser as ClapParser;
 use commands::{
-    authorities::discover_authorities, authority_check::check_authorities,
-    bootnodes::verify_bootnodes, discovery::discover_network, extrinsics::submit_extrinsics,
+    authorities::{discover_authorities, resolve_bootnodes},
+    authority_check::check_authorities,
+    bootnodes::verify_bootnodes,
+    discovery::discover_network,
+    extrinsics::submit_extrinsics,
 };
+use jsonrpsee::client_transport::ws::Url;
 use std::{error::Error, io::Read, path::PathBuf};
 
 /// Command for interacting with the CLI.
@@ -235,10 +239,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
+            let rpc_url = Url::parse(&opts.url)?;
+            let bootnodes = resolve_bootnodes(&rpc_url, opts.bootnodes).await?;
             discover_authorities(
                 opts.url,
                 opts.genesis,
-                opts.bootnodes,
+                bootnodes,
                 opts.timeout,
                 opts.address_format,
                 opts.raw_output,
