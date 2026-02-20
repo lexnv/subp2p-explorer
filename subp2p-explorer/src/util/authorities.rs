@@ -64,10 +64,7 @@ pub fn decode_dht_record(
         .into());
     }
 
-    let peer_id = *peer_ids
-        .iter()
-        .next()
-        .expect("At least one peerId; qed");
+    let peer_id = *peer_ids.iter().next().expect("At least one peerId; qed");
 
     // Verify peer signature.
     let Some(peer_signature) = payload.peer_signature else {

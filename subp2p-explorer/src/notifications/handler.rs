@@ -50,13 +50,8 @@ pub struct NotificationsHandler {
     protocols: Vec<ProtocolDetails>,
 
     /// Events that are pending to be processed by `poll()`.
-    pending_events: VecDeque<
-        ConnectionHandlerEvent<
-            HandshakeOutbound,
-            usize,
-            NotificationsHandlerToBehavior,
-        >,
-    >,
+    pending_events:
+        VecDeque<ConnectionHandlerEvent<HandshakeOutbound, usize, NotificationsHandlerToBehavior>>,
 
     /// Whether we are the connection dialer or listener.
     endpoint: ConnectedPoint,
@@ -591,11 +586,7 @@ impl ConnectionHandler for NotificationsHandler {
         &mut self,
         cx: &mut Context,
     ) -> Poll<
-        ConnectionHandlerEvent<
-            Self::OutboundProtocol,
-            Self::OutboundOpenInfo,
-            Self::ToBehaviour,
-        >,
+        ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
     > {
         if let Some(ev) = self.pending_events.pop_front() {
             return Poll::Ready(ev);

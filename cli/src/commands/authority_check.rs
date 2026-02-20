@@ -6,6 +6,7 @@ use crate::commands::authorities::{
     detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
     runtime_api_autorities, AuthorityDiscovery,
 };
+use crate::commands::identity::fetch_identity_names;
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
@@ -95,6 +96,7 @@ struct AddressCheck {
 /// Aggregated result of checking a single authority.
 struct AuthorityResult {
     authority_ss58: String,
+    identity_name: Option<String>,
     peer_id: Option<PeerId>,
     agent_version: Option<String>,
     has_dht_record: bool,
@@ -104,6 +106,7 @@ struct AuthorityResult {
 /// Global statistics computed from all authority results.
 struct GlobalStats {
     total_authorities: usize,
+    with_identity: usize,
     with_dht_records: usize,
     with_peer_id: usize,
     identified: usize,
@@ -210,9 +213,38 @@ async fn run_connectivity_checks(
     grouped
 }
 
+/// An authority is considered failing when it has no DHT record, has no public
+/// addresses, or at least one public address is unreachable.
+fn is_authority_failing(result: &AuthorityResult) -> bool {
+    if !result.has_dht_record {
+        return true;
+    }
+
+    let public: Vec<_> = result
+        .addresses
+        .iter()
+        .filter(|a| a.is_public && !matches!(a.result, AddressResult::Skipped(_)))
+        .collect();
+
+    if public.is_empty() {
+        return true;
+    }
+
+    public
+        .iter()
+        .any(|a| matches!(a.result, AddressResult::Failed(_)))
+}
+
 /// Print the per-authority check result in a formatted table.
-fn print_authority_result(w: &mut DualWriter, result: &AuthorityResult, index: usize) -> io::Result<()> {
-    writeln!(w, "────────────────────────────────────────────────────────────────────────")?;
+fn print_authority_result(
+    w: &mut DualWriter,
+    result: &AuthorityResult,
+    index: usize,
+) -> io::Result<()> {
+    writeln!(
+        w,
+        "────────────────────────────────────────────────────────────────────────"
+    )?;
     write!(w, "  Authority #{}: {}", index + 1, result.authority_ss58)?;
 
     if !result.has_dht_record {
@@ -221,11 +253,14 @@ fn print_authority_result(w: &mut DualWriter, result: &AuthorityResult, index: u
     }
     writeln!(w)?;
 
+    if let Some(ref name) = result.identity_name {
+        writeln!(w, "  Identity: {}", name)?;
+    }
     if let Some(ref peer_id) = result.peer_id {
-        writeln!(w, "  PeerId: {}", peer_id)?;
+        writeln!(w, "  PeerId:   {}", peer_id)?;
     }
     if let Some(ref agent) = result.agent_version {
-        writeln!(w, "  Agent:  {}", agent)?;
+        writeln!(w, "  Agent:    {}", agent)?;
     }
 
     if result.addresses.is_empty() {
@@ -319,6 +354,7 @@ fn normalize_agent_version(version: &str) -> String {
 fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
     let mut stats = GlobalStats {
         total_authorities: results.len(),
+        with_identity: 0,
         with_dht_records: 0,
         with_peer_id: 0,
         identified: 0,
@@ -333,6 +369,9 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
     };
 
     for r in results {
+        if r.identity_name.is_some() {
+            stats.with_identity += 1;
+        }
         if r.has_dht_record {
             stats.with_dht_records += 1;
         }
@@ -395,9 +434,15 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
     };
 
     writeln!(w)?;
-    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(
+        w,
+        "════════════════════════════════════════════════════════════════════════"
+    )?;
     writeln!(w, "                          GLOBAL SUMMARY")?;
-    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(
+        w,
+        "════════════════════════════════════════════════════════════════════════"
+    )?;
     writeln!(w)?;
 
     writeln!(w, "  Authorities")?;
@@ -405,6 +450,12 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
         w,
         "  ├─ Total (runtime API):          {:>6}",
         stats.total_authorities
+    )?;
+    writeln!(
+        w,
+        "  ├─ With on-chain identity:       {:>6} ({})",
+        stats.with_identity,
+        pct(stats.with_identity, stats.total_authorities)
     )?;
     writeln!(
         w,
@@ -508,15 +559,15 @@ pub async fn check_authorities(
     dial_timeout: Duration,
     address_format: Option<String>,
     query_timeout: Duration,
+    identity_rpc: Option<String>,
+    show_failing_only: bool,
 ) -> Result<(), Box<dyn Error>> {
     let rpc_url = Url::parse(&url)?;
 
     // Create cache directory and log file.
     let cache_file = match fs::create_dir_all("cache") {
         Ok(()) => {
-            let chain = detect_chain_name(&rpc_url)
-                .unwrap_or("unknown")
-                .to_string();
+            let chain = detect_chain_name(&rpc_url).unwrap_or("unknown").to_string();
             let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
             let path = format!("cache/{}-{}.logs", chain, timestamp);
             match File::create(&path) {
@@ -538,19 +589,22 @@ pub async fn check_authorities(
 
     let mut w = DualWriter::new(cache_file);
 
-    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(
+        w,
+        "════════════════════════════════════════════════════════════════════════"
+    )?;
     writeln!(w, "                         AUTHORITY CHECK")?;
-    writeln!(w, "════════════════════════════════════════════════════════════════════════")?;
+    writeln!(
+        w,
+        "════════════════════════════════════════════════════════════════════════"
+    )?;
     writeln!(w)?;
 
     // Resolve SS58 prefix: use provided format name or fetch from RPC.
     let version = match address_format {
         Some(fmt) => {
-            let format_registry =
-                ss58_registry::Ss58AddressFormatRegistry::try_from(fmt.as_str())
-                    .map_err(|err| {
-                        format!("Cannot parse the provided address format: {:?}", err)
-                    })?;
+            let format_registry = ss58_registry::Ss58AddressFormatRegistry::try_from(fmt.as_str())
+                .map_err(|err| format!("Cannot parse the provided address format: {:?}", err))?;
             let v: ss58_registry::Ss58AddressFormat = format_registry.into();
             v.prefix()
         }
@@ -561,7 +615,11 @@ pub async fn check_authorities(
                 ss58_registry::Ss58AddressFormat::custom(prefix),
             );
             match name {
-                Ok(registry) => writeln!(w, "       Address format: {:?} (prefix: {})", registry, prefix)?,
+                Ok(registry) => writeln!(
+                    w,
+                    "       Address format: {:?} (prefix: {})",
+                    registry, prefix
+                )?,
                 Err(_) => writeln!(w, "       SS58 prefix: {}", prefix)?,
             }
             writeln!(w)?;
@@ -584,16 +642,24 @@ pub async fn check_authorities(
     // Resolve bootnodes: use provided ones, fetch from RPC, and merge with published chainspec.
     let bootnodes = resolve_bootnodes(&rpc_url, bootnodes, &mut w).await?;
 
-    // Phase 1: Fetch authorities from the runtime API.
-    writeln!(w, "[1/3] Fetching authorities from runtime API...")?;
-    let authorities = runtime_api_autorities(rpc_url).await?;
+    writeln!(w, "[1/4] Fetching authorities from runtime API...")?;
+    let authorities = runtime_api_autorities(rpc_url.clone()).await?;
     writeln!(w, "       Found {} authorities", authorities.len())?;
     writeln!(w)?;
 
-    // Phase 2: DHT Discovery — scrape authority records for addresses and peer IDs.
+    let identity_url = identity_rpc
+        .map(|s| Url::parse(&s))
+        .transpose()
+        .map_err(|e| format!("Invalid --identity-rpc URL: {}", e))?;
+
+    writeln!(w, "[2/4] Resolving on-chain identities...")?;
+    let identity_names =
+        fetch_identity_names(rpc_url.clone(), identity_url, &authorities, &mut w).await;
+    writeln!(w)?;
+
     writeln!(
         w,
-        "[2/3] Discovering authority DHT records (timeout: {}s)...",
+        "[3/4] Discovering authority DHT records (timeout: {}s)...",
         timeout.as_secs()
     )?;
     let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
@@ -636,7 +702,7 @@ pub async fn check_authorities(
     let public_count = pending_checks.iter().filter(|(_, _, p)| *p).count();
     writeln!(
         w,
-        "[3/3] Checking connectivity ({} addresses, {} public, timeout: {}s/addr)...",
+        "[4/4] Checking connectivity ({} addresses, {} public, timeout: {}s/addr)...",
         pending_checks.len(),
         public_count,
         dial_timeout.as_secs()
@@ -651,9 +717,12 @@ pub async fn check_authorities(
     for (idx, authority) in authorities.iter().enumerate() {
         let authority_ss58 = to_ss58(authority, version);
 
+        let identity_name = identity_names.get(authority).cloned();
+
         let Some(addrs) = discovery.authority_to_details().get(authority) else {
             results.push(AuthorityResult {
                 authority_ss58,
+                identity_name,
                 peer_id: None,
                 agent_version: None,
                 has_dht_record: false,
@@ -670,6 +739,7 @@ pub async fn check_authorities(
 
         results.push(AuthorityResult {
             authority_ss58,
+            identity_name,
             peer_id,
             agent_version,
             has_dht_record: true,
@@ -679,6 +749,9 @@ pub async fn check_authorities(
 
     // Print per-authority details.
     for (i, result) in results.iter().enumerate() {
+        if show_failing_only && !is_authority_failing(result) {
+            continue;
+        }
         print_authority_result(&mut w, result, i)?;
     }
 

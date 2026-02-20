@@ -253,85 +253,84 @@ impl Stream for Libp2pBackend {
 
         log::trace!("libp2p event {:?}", event);
 
-        if let libp2p::swarm::SwarmEvent::Behaviour(event) = event { match event {
-            BehaviourEvent::Identify(IdentifyEvent::Received { peer_id, info, .. }) => {
-                return Poll::Ready(Some(NetworkEvent::PeerIdentified {
-                    peer: peer_id.into(),
-                    protocol_version: Some(info.protocol_version),
-                    user_agent: Some(info.agent_version),
-                    supported_protocols: info
-                        .protocols
-                        .into_iter()
-                        .map(|p| p.to_string())
-                        .collect(),
-                    observed_address: info.observed_addr.into(),
-                    listen_addresses: info.listen_addrs.into_iter().map(Into::into).collect(),
-                }));
-            }
-            BehaviourEvent::Discovery(event) => match event {
-                KademliaEvent::OutboundQueryProgressed {
-                    id,
-                    result: QueryResult::GetClosestPeers(result),
-                    ..
-                } => {
-                    let (key, peers) = match result {
-                        Ok(res) => (res.key, res.peers),
-                        Err(GetClosestPeersError::Timeout { key, peers }) => {
-                            log::warn!("Query timed out for key {:?} {:?}", key, id);
-                            (key, peers)
-                        }
-                    };
-
-                    // Get the subp2p query ID.
-                    let query_id = this.query_translate.remove(&id).unwrap();
-
-                    return Poll::Ready(Some(NetworkEvent::FindNode {
-                        query_id,
-                        target: PeerId::from_bytes(key.as_ref()).unwrap(),
-                        peers: peers
+        if let libp2p::swarm::SwarmEvent::Behaviour(event) = event {
+            match event {
+                BehaviourEvent::Identify(IdentifyEvent::Received { peer_id, info, .. }) => {
+                    return Poll::Ready(Some(NetworkEvent::PeerIdentified {
+                        peer: peer_id.into(),
+                        protocol_version: Some(info.protocol_version),
+                        user_agent: Some(info.agent_version),
+                        supported_protocols: info
+                            .protocols
                             .into_iter()
-                            .map(|peer_id| {
-                                (
-                                    peer_id.peer_id.into(),
-                                    peer_id.addrs.into_iter().map(Into::into).collect(),
-                                )
-                            })
+                            .map(|p| p.to_string())
                             .collect(),
+                        observed_address: info.observed_addr.into(),
+                        listen_addresses: info.listen_addrs.into_iter().map(Into::into).collect(),
                     }));
                 }
+                BehaviourEvent::Discovery(event) => match event {
+                    KademliaEvent::OutboundQueryProgressed {
+                        id,
+                        result: QueryResult::GetClosestPeers(result),
+                        ..
+                    } => {
+                        let (key, peers) = match result {
+                            Ok(res) => (res.key, res.peers),
+                            Err(GetClosestPeersError::Timeout { key, peers }) => {
+                                log::warn!("Query timed out for key {:?} {:?}", key, id);
+                                (key, peers)
+                            }
+                        };
 
-                // Collect addresses during discovery.
-                KademliaEvent::RoutablePeer { peer, address }
-                | KademliaEvent::PendingRoutablePeer { peer, address } => {
-                    let command_rx = this.command_tx.clone();
-                    let pending_address = address.clone();
-                    this.pending_actions.push(Box::pin(async move {
-                        command_rx
-                            .send(InnerCommand::AddKnownAddress {
-                                peer_id: peer,
-                                address: pending_address,
-                            })
-                            .await
-                            .expect("Backend task closed; this should never happen");
-                    }));
+                        // Get the subp2p query ID.
+                        let query_id = this.query_translate.remove(&id).unwrap();
 
-                    this.peer_addresses
-                        .entry(peer)
-                        .or_default()
-                        .push(address);
-                }
-                KademliaEvent::RoutingUpdated {
-                    peer, addresses, ..
-                } => {
-                    this.peer_addresses
-                        .entry(peer)
-                        .or_default()
-                        .extend(addresses.into_vec());
-                }
+                        return Poll::Ready(Some(NetworkEvent::FindNode {
+                            query_id,
+                            target: PeerId::from_bytes(key.as_ref()).unwrap(),
+                            peers: peers
+                                .into_iter()
+                                .map(|peer_id| {
+                                    (
+                                        peer_id.peer_id.into(),
+                                        peer_id.addrs.into_iter().map(Into::into).collect(),
+                                    )
+                                })
+                                .collect(),
+                        }));
+                    }
+
+                    // Collect addresses during discovery.
+                    KademliaEvent::RoutablePeer { peer, address }
+                    | KademliaEvent::PendingRoutablePeer { peer, address } => {
+                        let command_rx = this.command_tx.clone();
+                        let pending_address = address.clone();
+                        this.pending_actions.push(Box::pin(async move {
+                            command_rx
+                                .send(InnerCommand::AddKnownAddress {
+                                    peer_id: peer,
+                                    address: pending_address,
+                                })
+                                .await
+                                .expect("Backend task closed; this should never happen");
+                        }));
+
+                        this.peer_addresses.entry(peer).or_default().push(address);
+                    }
+                    KademliaEvent::RoutingUpdated {
+                        peer, addresses, ..
+                    } => {
+                        this.peer_addresses
+                            .entry(peer)
+                            .or_default()
+                            .extend(addresses.into_vec());
+                    }
+                    _ => (),
+                },
                 _ => (),
-            },
-            _ => (),
-        } };
+            }
+        };
 
         // Since we are only interested in some events from the backend,
         // we need to wake up the task again to poll for more events.

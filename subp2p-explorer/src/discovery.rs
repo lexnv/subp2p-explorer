@@ -73,9 +73,8 @@ impl DiscoveryBuilder {
 
     /// Build the discovery protocol.
     pub fn build(self, local_peer_id: PeerId, genesis_hash: &str) -> Discovery {
-        let kademlia_protocol =
-            StreamProtocol::try_from_owned(format!("/{genesis_hash}/kad"))
-                .expect("Protocol name starts with '/'; qed");
+        let kademlia_protocol = StreamProtocol::try_from_owned(format!("/{genesis_hash}/kad"))
+            .expect("Protocol name starts with '/'; qed");
 
         let mut config = kad::Config::new(kademlia_protocol);
         config.set_max_packet_size(self.max_packet_size);
