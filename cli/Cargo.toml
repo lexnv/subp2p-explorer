@@ -46,3 +46,5 @@ jsonrpsee = { workspace = true, features = ["async-client", "client-ws-transport
 ss58-registry = { version = "1.34.0", default-features = false }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+twox-hash = { workspace = true }
+blake2b_simd = { workspace = true }

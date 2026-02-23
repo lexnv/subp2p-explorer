@@ -65,12 +65,13 @@ impl Locator {
 
         Some(Location {
             city: city.into_string(),
-            _accuracy_radius: location.clone().and_then(|loc: maxminddb::geoip2::city::Location| loc.accuracy_radius),
+            _accuracy_radius: location
+                .clone()
+                .and_then(|loc: maxminddb::geoip2::city::Location| loc.accuracy_radius),
             _latitude: location.clone().and_then(|loc| loc.latitude),
             _longitude: location.clone().and_then(|loc| loc.longitude),
             _metro_code: location.clone().and_then(|loc| loc.metro_code),
-            _time_zone: location
-                .and_then(|loc| loc.time_zone.map(|zone| zone.to_string())),
+            _time_zone: location.and_then(|loc| loc.time_zone.map(|zone| zone.to_string())),
         })
     }
 }
@@ -132,12 +133,10 @@ pub async fn build_swarm(
         .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
         .await
         .expect("Can construct WebSocket; qed")
-        .with_behaviour(|_key| {
-            Behaviour {
-                notifications,
-                peer_info,
-                discovery,
-            }
+        .with_behaviour(|_key| Behaviour {
+            notifications,
+            peer_info,
+            discovery,
         })
         .expect("Can construct behaviour; qed")
         .build();

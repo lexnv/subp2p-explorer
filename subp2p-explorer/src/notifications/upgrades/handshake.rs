@@ -405,8 +405,7 @@ where
 
             {
                 let mut buf = unsigned_varint::encode::usize_buffer();
-                let encoded_len =
-                    unsigned_varint::encode::usize(self.handshake.len(), &mut buf);
+                let encoded_len = unsigned_varint::encode::usize(self.handshake.len(), &mut buf);
                 socket.write_all(encoded_len).await?;
                 socket.write_all(&self.handshake).await?;
                 socket.flush().await?;

@@ -4481,6 +4481,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "asynchronous-codec 0.6.2",
+ "blake2b_simd",
  "bytes",
  "chrono",
  "clap",
@@ -4509,6 +4510,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-dns-resolver",
+ "twox-hash",
  "unsigned-varint 0.7.2",
  "void",
 ]
@@ -5094,6 +5096,17 @@ dependencies = [
  "thiserror 2.0.12",
  "url",
  "utf-8",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "rand 0.8.5",
+ "static_assertions",
 ]
 
 [[package]]

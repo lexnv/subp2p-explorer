@@ -7,3 +7,4 @@ pub mod authority_check;
 pub mod bootnodes;
 pub mod discovery;
 pub mod extrinsics;
+pub mod identity;

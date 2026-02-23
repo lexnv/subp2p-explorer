@@ -230,10 +230,7 @@ impl NetworkBehaviour for PeerBehaviour {
         }
     }
 
-    fn poll(
-        &mut self,
-        cx: &mut Context,
-    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         loop {
             match self.ping.poll(cx) {
                 Poll::Pending => break,

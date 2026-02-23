@@ -116,7 +116,10 @@ pub(crate) async fn resolve_bootnodes(
     w: &mut impl Write,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut bootnodes = if cli_bootnodes.is_empty() {
-        writeln!(w, "       No bootnodes provided, fetching from chain spec via RPC...")?;
+        writeln!(
+            w,
+            "       No bootnodes provided, fetching from chain spec via RPC..."
+        )?;
         let fetched = fetch_bootnodes_from_rpc(rpc_url.clone()).await?;
         writeln!(w, "       Fetched {} bootnodes from RPC", fetched.len())?;
         fetched
@@ -125,7 +128,11 @@ pub(crate) async fn resolve_bootnodes(
     };
 
     if let Some(chain) = detect_chain_name(rpc_url) {
-        writeln!(w, "       Detected known chain \"{}\", downloading published chainspec bootnodes...", chain)?;
+        writeln!(
+            w,
+            "       Detected known chain \"{}\", downloading published chainspec bootnodes...",
+            chain
+        )?;
         match fetch_bootnodes_from_chainspec(chain).await {
             Ok(extra) => {
                 let unique_peers: HashSet<_> = extra
@@ -150,8 +157,16 @@ pub(crate) async fn resolve_bootnodes(
                 bootnodes = seen.into_iter().collect();
             }
             Err(e) => {
-                log::warn!("Failed to fetch published chainspec bootnodes for {}: {}", chain, e);
-                writeln!(w, "       Warning: could not fetch published chainspec bootnodes: {}", e)?;
+                log::warn!(
+                    "Failed to fetch published chainspec bootnodes for {}: {}",
+                    chain,
+                    e
+                );
+                writeln!(
+                    w,
+                    "       Warning: could not fetch published chainspec bootnodes: {}",
+                    e
+                )?;
             }
         }
     }
@@ -177,9 +192,7 @@ pub(crate) async fn fetch_genesis_hash(url: Url) -> Result<String, Box<dyn std::
 pub(crate) async fn fetch_ss58_prefix(url: Url) -> Result<u16, Box<dyn std::error::Error>> {
     let client = client(url).await?;
 
-    let props: serde_json::Value = client
-        .request("system_properties", rpc_params![])
-        .await?;
+    let props: serde_json::Value = client.request("system_properties", rpc_params![]).await?;
 
     let prefix = props
         .get("ss58Format")
@@ -482,7 +495,10 @@ impl AuthorityDiscovery {
                             // Dial the peer so the identify protocol can run.
                             if !self.peer_info.contains_key(&peer_id) {
                                 for addr in &addresses {
-                                    self.swarm.behaviour_mut().discovery.add_address(&peer_id, addr.clone());
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .discovery
+                                        .add_address(&peer_id, addr.clone());
                                 }
                                 let _ = self.swarm.dial(peer_id);
                             }

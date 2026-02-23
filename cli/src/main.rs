@@ -96,6 +96,18 @@ pub struct AuthorityCheckOpts {
     /// do not exist in the DHT.
     #[clap(long, default_value = "15", value_parser = parse_duration)]
     query_timeout: std::time::Duration,
+    /// The RPC endpoint of the chain that hosts on-chain identities
+    /// (e.g., the People parachain `wss://polkadot-people-rpc.polkadot.io`).
+    ///
+    /// When provided, authority display names are resolved from the Identity
+    /// pallet on that chain. If omitted, identities are looked up on the
+    /// relay chain itself.
+    #[clap(long)]
+    identity_rpc: Option<String>,
+    /// Show only authorities that have failures (no DHT record, unreachable
+    /// public addresses, or no public addresses at all).
+    #[clap(long)]
+    show_failing_only: bool,
 }
 
 /// Send extrinsic on the p2p network.
@@ -240,7 +252,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
             let rpc_url = Url::parse(&opts.url)?;
-            let bootnodes = resolve_bootnodes(&rpc_url, opts.bootnodes, &mut std::io::stdout()).await?;
+            let bootnodes =
+                resolve_bootnodes(&rpc_url, opts.bootnodes, &mut std::io::stdout()).await?;
             discover_authorities(
                 opts.url,
                 opts.genesis,
@@ -262,6 +275,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.dial_timeout,
                 opts.address_format,
                 opts.query_timeout,
+                opts.identity_rpc,
+                opts.show_failing_only,
             )
             .await
         }
