@@ -18,6 +18,17 @@ use std::io::{self, BufWriter, Write};
 use std::time::{Duration, Instant};
 use subp2p_explorer::util::p2p::get_peer_id;
 use subp2p_explorer::util::ss58::to_ss58;
+
+/// Filter mode for `--show-failing-only`.
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum FailFilter {
+    /// Show authorities where at least one public address is unreachable,
+    /// or that have no DHT record / no public addresses.
+    Any,
+    /// Show only authorities where all public addresses are unreachable,
+    /// or that have no DHT record / no public addresses.
+    All,
+}
 use tokio::net::TcpStream;
 
 /// Maximum number of concurrent TCP connection checks.
@@ -215,7 +226,7 @@ async fn run_connectivity_checks(
 
 /// An authority is considered failing when it has no DHT record, has no public
 /// addresses, or at least one public address is unreachable.
-fn is_authority_failing(result: &AuthorityResult) -> bool {
+fn is_authority_failing(result: &AuthorityResult, filter: &FailFilter) -> bool {
     if !result.has_dht_record {
         return true;
     }
@@ -230,9 +241,14 @@ fn is_authority_failing(result: &AuthorityResult) -> bool {
         return true;
     }
 
-    public
-        .iter()
-        .any(|a| matches!(a.result, AddressResult::Failed(_)))
+    match filter {
+        FailFilter::Any => public
+            .iter()
+            .any(|a| matches!(a.result, AddressResult::Failed(_))),
+        FailFilter::All => public
+            .iter()
+            .all(|a| matches!(a.result, AddressResult::Failed(_))),
+    }
 }
 
 /// Print the per-authority check result in a formatted table.
@@ -249,6 +265,9 @@ fn print_authority_result(
 
     if !result.has_dht_record {
         writeln!(w, " — No DHT record")?;
+        if let Some(ref name) = result.identity_name {
+            writeln!(w, "  Identity: {}", name)?;
+        }
         return Ok(());
     }
     writeln!(w)?;
@@ -560,7 +579,7 @@ pub async fn check_authorities(
     address_format: Option<String>,
     query_timeout: Duration,
     identity_rpc: Option<String>,
-    show_failing_only: bool,
+    show_failing_only: Option<FailFilter>,
 ) -> Result<(), Box<dyn Error>> {
     let rpc_url = Url::parse(&url)?;
 
@@ -749,8 +768,10 @@ pub async fn check_authorities(
 
     // Print per-authority details.
     for (i, result) in results.iter().enumerate() {
-        if show_failing_only && !is_authority_failing(result) {
-            continue;
+        if let Some(ref filter) = show_failing_only {
+            if !is_authority_failing(result, filter) {
+                continue;
+            }
         }
         print_authority_result(&mut w, result, i)?;
     }
