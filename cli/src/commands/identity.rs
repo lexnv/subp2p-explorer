@@ -302,8 +302,11 @@ pub async fn fetch_identity_names(
         }
     };
 
-    let stash_to_auth: HashMap<[u8; 32], sr25519::PublicKey> =
-        auth_to_stash.iter().map(|(a, s)| (*s, *a)).collect();
+    let mut stash_to_auth: HashMap<[u8; 32], Vec<sr25519::PublicKey>> = HashMap::new();
+    for (auth, stash) in &auth_to_stash {
+        stash_to_auth.entry(*stash).or_default().push(*auth);
+    }
+
     let unique_stashes: Vec<[u8; 32]> = stash_to_auth.keys().copied().collect();
 
     let identity_keys: Vec<String> = unique_stashes
@@ -327,9 +330,11 @@ pub async fn fetch_identity_names(
     let mut missing_stashes: Vec<[u8; 32]> = Vec::new();
     for (stash, hex_key) in unique_stashes.iter().zip(identity_keys.iter()) {
         if let Some(value) = identity_values.get(hex_key) {
-            if let Some(display) = decode_display_name(value) {
-                if let Some(auth) = stash_to_auth.get(stash) {
-                    names.insert(*auth, display);
+            if let Some(display) = decode_display_name(value) 
+                if let Some(auths) = stash_to_auth.get(stash) {
+                    for auth in auths {
+                        names.insert(*auth, display.clone());
+                    }
                 }
                 continue;
             }
@@ -344,11 +349,20 @@ pub async fn fetch_identity_names(
             .collect();
 
         if let Ok(super_values) = batch_get_storage(&identity_client, &super_keys).await {
-            let mut parent_to_children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+            let mut parent_to_children: HashMap<[u8; 32], Vec<([u8; 32], Option<String>)>> =
+                HashMap::new();
             for (stash, hex_key) in missing_stashes.iter().zip(super_keys.iter()) {
                 if let Some(value) = super_values.get(hex_key) {
                     if let Some(parent) = decode_super_of_parent(value) {
-                        parent_to_children.entry(parent).or_default().push(*stash);
+                        let sub_name = if value.len() > 32 {
+                            decode_data_as_string(&mut &value[32..])
+                        } else {
+                            None
+                        };
+                        parent_to_children
+                            .entry(parent)
+                            .or_default()
+                            .push((*stash, sub_name));
                     }
                 }
             }
@@ -366,9 +380,17 @@ pub async fn fetch_identity_names(
                     for (parent, hex_key) in parent_accounts.iter().zip(parent_id_keys.iter()) {
                         if let Some(value) = parent_values.get(hex_key) {
                             if let Some(display) = decode_display_name(value) {
-                                for child in parent_to_children.get(parent).into_iter().flatten() {
-                                    if let Some(auth) = stash_to_auth.get(child) {
-                                        names.insert(*auth, display.clone());
+                                for (child, sub_name) in
+                                    parent_to_children.get(parent).into_iter().flatten()
+                                {
+                                    let name = match sub_name {
+                                        Some(sub) => format!("{}/{}", display, sub),
+                                        None => display.clone(),
+                                    };
+                                    if let Some(auths) = stash_to_auth.get(child) {
+                                        for auth in auths {
+                                            names.insert(*auth, name.clone());
+                                        }
                                     }
                                 }
                             }

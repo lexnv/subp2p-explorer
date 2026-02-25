@@ -8,7 +8,7 @@ mod utils;
 use clap::Parser as ClapParser;
 use commands::{
     authorities::{discover_authorities, resolve_bootnodes},
-    authority_check::check_authorities,
+    authority_check::{check_authorities, FailFilter},
     bootnodes::verify_bootnodes,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
@@ -104,10 +104,11 @@ pub struct AuthorityCheckOpts {
     /// relay chain itself.
     #[clap(long)]
     identity_rpc: Option<String>,
-    /// Show only authorities that have failures (no DHT record, unreachable
-    /// public addresses, or no public addresses at all).
-    #[clap(long)]
-    show_failing_only: bool,
+    /// Show only authorities that have failures. Accepts "any" (default) to show
+    /// authorities where at least one address fails, or "all" to show only those
+    /// where every address fails (or no DHT record exists).
+    #[clap(long, default_missing_value = "any", num_args = 0..=1)]
+    show_failing_only: Option<FailFilter>,
 }
 
 /// Send extrinsic on the p2p network.
