@@ -108,6 +108,9 @@ pub struct AuthorityCheckOpts {
     /// public addresses, or no public addresses at all).
     #[clap(long)]
     show_failing_only: bool,
+    /// Write the full results as a JSON report to the given file path.
+    #[clap(long)]
+    json: Option<PathBuf>,
 }
 
 /// Send extrinsic on the p2p network.
@@ -277,6 +280,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.query_timeout,
                 opts.identity_rpc,
                 opts.show_failing_only,
+                opts.json,
             )
             .await
         }

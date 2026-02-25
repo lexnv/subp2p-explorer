@@ -10,11 +10,13 @@ use crate::commands::identity::fetch_identity_names;
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
-use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{multiaddr::Protocol, Multiaddr};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use subp2p_explorer::util::p2p::get_peer_id;
 use subp2p_explorer::util::ss58::to_ss58;
@@ -77,6 +79,8 @@ impl Write for DualWriter {
 }
 
 /// Result of checking a single address.
+#[derive(Serialize)]
+#[serde(tag = "status", content = "reason")]
 enum AddressResult {
     /// TCP connection succeeded.
     Ok,
@@ -87,6 +91,7 @@ enum AddressResult {
 }
 
 /// Address check details for a single multiaddress.
+#[derive(Serialize)]
 struct AddressCheck {
     address_short: String,
     is_public: bool,
@@ -94,16 +99,18 @@ struct AddressCheck {
 }
 
 /// Aggregated result of checking a single authority.
+#[derive(Serialize)]
 struct AuthorityResult {
     authority_ss58: String,
     identity_name: Option<String>,
-    peer_id: Option<PeerId>,
+    peer_id: Option<String>,
     agent_version: Option<String>,
     has_dht_record: bool,
     addresses: Vec<AddressCheck>,
 }
 
 /// Global statistics computed from all authority results.
+#[derive(Serialize)]
 struct GlobalStats {
     total_authorities: usize,
     with_identity: usize,
@@ -118,6 +125,15 @@ struct GlobalStats {
     reachable_authorities: usize,
     fully_reachable_authorities: usize,
     agent_versions: HashMap<String, usize>,
+}
+
+/// Top-level JSON report containing all authority results and global statistics.
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    chain: Option<&'static str>,
+    rpc_url: &'a str,
+    authorities: &'a [AuthorityResult],
+    stats: &'a GlobalStats,
 }
 
 /// Remove the `/p2p/<peer_id>` suffix from a multiaddress for compact display.
@@ -561,6 +577,7 @@ pub async fn check_authorities(
     query_timeout: Duration,
     identity_rpc: Option<String>,
     show_failing_only: bool,
+    json_output: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let rpc_url = Url::parse(&url)?;
 
@@ -740,7 +757,7 @@ pub async fn check_authorities(
         results.push(AuthorityResult {
             authority_ss58,
             identity_name,
-            peer_id,
+            peer_id: peer_id.map(|p| p.to_string()),
             agent_version,
             has_dht_record: true,
             addresses,
@@ -758,6 +775,19 @@ pub async fn check_authorities(
     // Print global summary.
     let stats = compute_global_stats(&results);
     print_global_summary(&mut w, &stats)?;
+
+    // Write JSON report if requested.
+    if let Some(ref path) = json_output {
+        let report = JsonReport {
+            chain: detect_chain_name(&rpc_url),
+            rpc_url: rpc_url.as_str(),
+            authorities: &results,
+            stats: &stats,
+        };
+        let file = File::create(path)?;
+        serde_json::to_writer_pretty(file, &report)?;
+        eprintln!("       JSON report written to {}", path.display());
+    }
 
     w.flush()?;
     Ok(())
