@@ -767,14 +767,30 @@ impl AuthorityDiscovery {
     }
 
     /// Returns a reference to the discovered peer info.
+    #[allow(dead_code)]
     pub fn peer_info(&self) -> &HashMap<PeerId, Info> {
         &self.peer_info
     }
 
     /// Returns a reference to the mapping between the authority discovery public key and the
     /// discovered addresses.
+    #[allow(dead_code)]
     pub fn authority_to_details(&self) -> &HashMap<sr25519::PublicKey, HashSet<Multiaddr>> {
         &self.authority_to_details
+    }
+
+    /// Consume the discovery state and return the collected results.
+    ///
+    /// This drops the underlying swarm, freeing its network connections and
+    /// file descriptors so that subsequent phases (e.g. TCP reachability
+    /// checks) do not hit the open-file limit.
+    pub fn into_results(
+        self,
+    ) -> (
+        HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
+        HashMap<PeerId, Info>,
+    ) {
+        (self.authority_to_details, self.peer_info)
     }
 }
 

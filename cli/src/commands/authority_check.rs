@@ -172,12 +172,17 @@ async fn check_tcp_reachable(endpoint: &str, timeout: Duration) -> Result<(), St
     }
 }
 
-/// Run TCP connectivity checks for all addresses concurrently.
+/// Run TCP connectivity checks for all addresses in batches.
 ///
 /// Each entry in `checks` is `(authority_index, multiaddr, is_public)`.
 /// Returns results grouped by authority index.
+///
+/// Addresses are processed in batches of [`MAX_PARALLEL_CHECKS`] so that
+/// file descriptors from one batch are fully released before the next batch
+/// begins. This prevents "too many open files" errors on large networks
+/// (e.g. Kusama with 1000+ validators).
 async fn run_connectivity_checks(
-    checks: Vec<(usize, Multiaddr, bool)>,
+    mut checks: Vec<(usize, Multiaddr, bool)>,
     dial_timeout: Duration,
     w: &mut DualWriter,
 ) -> HashMap<usize, Vec<AddressCheck>> {
@@ -185,47 +190,63 @@ async fn run_connectivity_checks(
     let public_count = checks.iter().filter(|(_, _, p)| *p).count();
     let start = Instant::now();
 
-    let results: Vec<(usize, AddressCheck)> = futures::stream::iter(checks)
-        .map(|(idx, addr, is_public)| async move {
-            let address_short = shorten_address(&addr);
+    let mut grouped: HashMap<usize, Vec<AddressCheck>> = HashMap::new();
+    let mut checked = 0usize;
 
-            let result = if !is_public {
-                AddressResult::Skipped("private".into())
-            } else if let Some(endpoint) = extract_tcp_endpoint(&addr) {
-                match check_tcp_reachable(&endpoint, dial_timeout).await {
-                    Ok(()) => AddressResult::Ok,
-                    Err(e) => AddressResult::Failed(e),
-                }
-            } else {
-                AddressResult::Skipped("unsupported transport".into())
-            };
+    while !checks.is_empty() {
+        let batch_end = checks.len().min(MAX_PARALLEL_CHECKS);
+        let batch: Vec<_> = checks.drain(..batch_end).collect();
 
-            (
-                idx,
-                AddressCheck {
-                    address_short,
-                    is_public,
-                    result,
-                },
-            )
-        })
-        .buffer_unordered(MAX_PARALLEL_CHECKS)
-        .collect()
-        .await;
+        let batch_results: Vec<(usize, AddressCheck)> = futures::stream::iter(batch)
+            .map(|(idx, addr, is_public)| async move {
+                let address_short = shorten_address(&addr);
+
+                let result = if !is_public {
+                    AddressResult::Skipped("private".into())
+                } else if let Some(endpoint) = extract_tcp_endpoint(&addr) {
+                    match check_tcp_reachable(&endpoint, dial_timeout).await {
+                        Ok(()) => AddressResult::Ok,
+                        Err(e) => AddressResult::Failed(e),
+                    }
+                } else {
+                    AddressResult::Skipped("unsupported transport".into())
+                };
+
+                (
+                    idx,
+                    AddressCheck {
+                        address_short,
+                        is_public,
+                        result,
+                    },
+                )
+            })
+            .buffer_unordered(MAX_PARALLEL_CHECKS)
+            .collect()
+            .await;
+
+        checked += batch_results.len();
+        for (idx, check) in batch_results {
+            grouped.entry(idx).or_default().push(check);
+        }
+
+        let _ = write!(
+            w,
+            "\r       Checked {}/{} addresses ...",
+            checked, total,
+        );
+        let _ = w.flush();
+    }
 
     let elapsed = start.elapsed();
     let _ = writeln!(
         w,
-        "       Checked {} addresses ({} public) in {:.1}s",
+        "\r       Checked {} addresses ({} public) in {:.1}s                ",
         total,
         public_count,
         elapsed.as_secs_f64()
     );
 
-    let mut grouped: HashMap<usize, Vec<AddressCheck>> = HashMap::new();
-    for (idx, check) in results {
-        grouped.entry(idx).or_default().push(check);
-    }
     grouped
 }
 
@@ -684,15 +705,18 @@ pub async fn check_authorities(
     discovery.set_show_progress(true);
     discovery.discover().await;
 
-    let dht_count = discovery.authority_to_details().len();
+    // Extract the results and drop the swarm so its network connections and
+    // file descriptors are released before we open new TCP sockets in Phase 4.
+    let (authority_to_details, peer_info) = discovery.into_results();
+
+    let dht_count = authority_to_details.len();
     let identified_authorities = authorities
         .iter()
         .filter(|auth| {
-            discovery
-                .authority_to_details()
+            authority_to_details
                 .get(*auth)
                 .and_then(|addrs| addrs.iter().find_map(get_peer_id))
-                .map_or(false, |pid| discovery.peer_info().contains_key(&pid))
+                .map_or(false, |pid| peer_info.contains_key(&pid))
         })
         .count();
     writeln!(
@@ -708,7 +732,7 @@ pub async fn check_authorities(
     // Phase 3: TCP connectivity checks on every discovered address.
     let mut pending_checks: Vec<(usize, Multiaddr, bool)> = Vec::new();
     for (idx, authority) in authorities.iter().enumerate() {
-        if let Some(addrs) = discovery.authority_to_details().get(authority) {
+        if let Some(addrs) = authority_to_details.get(authority) {
             for addr in addrs {
                 let is_pub = is_public_address(addr);
                 pending_checks.push((idx, addr.clone(), is_pub));
@@ -736,7 +760,7 @@ pub async fn check_authorities(
 
         let identity_name = identity_names.get(authority).cloned();
 
-        let Some(addrs) = discovery.authority_to_details().get(authority) else {
+        let Some(addrs) = authority_to_details.get(authority) else {
             results.push(AuthorityResult {
                 authority_ss58,
                 identity_name,
@@ -750,7 +774,7 @@ pub async fn check_authorities(
 
         let peer_id = addrs.iter().find_map(get_peer_id);
         let agent_version = peer_id
-            .and_then(|pid| discovery.peer_info().get(&pid))
+            .and_then(|pid| peer_info.get(&pid))
             .map(|info| info.agent_version.clone());
         let addresses = check_results.remove(&idx).unwrap_or_default();
 
