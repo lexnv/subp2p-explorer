@@ -60,8 +60,8 @@ impl Libp2pBackend {
         disc_config.set_record_ttl(None);
         disc_config.set_provider_record_ttl(None);
         disc_config.set_query_timeout(std::time::Duration::from_secs(10));
-        let store = MemoryStore::new(local_peer_id.clone());
-        let discovery = Kademlia::with_config(local_peer_id.clone(), store, disc_config);
+        let store = MemoryStore::new(local_peer_id);
+        let discovery = Kademlia::with_config(local_peer_id, store, disc_config);
 
         let identify_config = IdentifyConfig::new("subp2p-explorer-0.1".into(), local_key.public())
             .with_cache_size(0);
@@ -253,8 +253,8 @@ impl Stream for Libp2pBackend {
 
         log::trace!("libp2p event {:?}", event);
 
-        match event {
-            libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
+        if let libp2p::swarm::SwarmEvent::Behaviour(event) = event {
+            match event {
                 BehaviourEvent::Identify(IdentifyEvent::Received { peer_id, info, .. }) => {
                     return Poll::Ready(Some(NetworkEvent::PeerIdentified {
                         peer: peer_id.into(),
@@ -316,24 +316,20 @@ impl Stream for Libp2pBackend {
                                 .expect("Backend task closed; this should never happen");
                         }));
 
-                        this.peer_addresses
-                            .entry(peer)
-                            .or_insert_with(Vec::new)
-                            .push(address);
+                        this.peer_addresses.entry(peer).or_default().push(address);
                     }
                     KademliaEvent::RoutingUpdated {
                         peer, addresses, ..
                     } => {
                         this.peer_addresses
                             .entry(peer)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .extend(addresses.into_vec());
                     }
                     _ => (),
                 },
                 _ => (),
-            },
-            _ => (),
+            }
         };
 
         // Since we are only interested in some events from the backend,

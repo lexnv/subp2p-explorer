@@ -171,7 +171,7 @@ impl Stream for Litep2pBackend {
             } = event;
 
             let tx = self.tx.clone();
-            let peer_id = peer.clone();
+            let peer_id = peer;
             let pending_listen_addresses: Vec<_> = listen_addresses
                 .clone()
                 .into_iter()

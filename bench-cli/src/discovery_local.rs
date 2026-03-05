@@ -28,7 +28,7 @@ pub async fn spawn_network(
     let mut iter = backends.iter_mut();
     let mut current = iter.next().expect("At least one backend; qed");
 
-    while let Some(next) = iter.next() {
+    for next in iter {
         let current_addr = current.listen_addresses().await;
         tracing::info!("Current address: {:?}", current_addr);
         let current_peer =

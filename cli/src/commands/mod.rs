@@ -3,6 +3,8 @@
 // see LICENSE for license details.
 
 pub mod authorities;
+pub mod authority_check;
 pub mod bootnodes;
 pub mod discovery;
 pub mod extrinsics;
+pub mod identity;

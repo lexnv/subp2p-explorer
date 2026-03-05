@@ -20,7 +20,7 @@ use libp2p::{
     core::ConnectedPoint,
     swarm::{
         handler::{ConnectionEvent, FullyNegotiatedInbound},
-        ConnectionHandler, ConnectionHandlerEvent, KeepAlive, Stream as NegotiatedSubstream,
+        ConnectionHandler, ConnectionHandlerEvent, Stream as NegotiatedSubstream,
         SubstreamProtocol,
     },
     PeerId,
@@ -50,14 +50,8 @@ pub struct NotificationsHandler {
     protocols: Vec<ProtocolDetails>,
 
     /// Events that are pending to be processed by `poll()`.
-    pending_events: VecDeque<
-        ConnectionHandlerEvent<
-            HandshakeOutbound,
-            usize,
-            NotificationsHandlerToBehavior,
-            NotificationsHandlerError,
-        >,
-    >,
+    pending_events:
+        VecDeque<ConnectionHandlerEvent<HandshakeOutbound, usize, NotificationsHandlerToBehavior>>,
 
     /// Whether we are the connection dialer or listener.
     endpoint: ConnectedPoint,
@@ -124,6 +118,7 @@ pub enum NotificationsHandlerToBehavior {
 ///                 |
 ///           OpenDesiredByRemote -> Opening -> Open
 /// ```
+#[allow(clippy::large_enum_variant)]
 pub enum State {
     /// Protocol is closed.
     Closed {
@@ -203,16 +198,10 @@ impl NotificationsHandler {
     }
 }
 
-/// Error specific to the collection of protocols.
-#[derive(Debug, thiserror::Error)]
-pub enum NotificationsHandlerError {}
-
 impl ConnectionHandler for NotificationsHandler {
     // Received and submitted events.
     type FromBehaviour = NotificationsHandlerFromBehavior;
     type ToBehaviour = NotificationsHandlerToBehavior;
-
-    type Error = NotificationsHandlerError;
 
     // Handle handshakes.
     type InboundProtocol = CombineUpgrades<HandshakeInbound>;
@@ -586,28 +575,18 @@ impl ConnectionHandler for NotificationsHandler {
         }
     }
 
-    fn connection_keep_alive(&self) -> KeepAlive {
-        if self
-            .protocols
+    fn connection_keep_alive(&self) -> bool {
+        self.protocols
             .iter()
             .any(|p| !matches!(p.state, State::Closed { .. }))
-        {
-            return KeepAlive::Yes;
-        }
-
-        KeepAlive::No
     }
 
+    #[allow(clippy::while_let_loop)]
     fn poll(
         &mut self,
         cx: &mut Context,
     ) -> Poll<
-        ConnectionHandlerEvent<
-            Self::OutboundProtocol,
-            Self::OutboundOpenInfo,
-            Self::ToBehaviour,
-            Self::Error,
-        >,
+        ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
     > {
         if let Some(ev) = self.pending_events.pop_front() {
             return Poll::Ready(ev);

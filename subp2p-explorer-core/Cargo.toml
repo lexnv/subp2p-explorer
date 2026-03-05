@@ -28,7 +28,7 @@ asynchronous-codec = { workspace = true }
 unsigned-varint = { workspace = true, features = ["futures", "asynchronous_codec"] }
 thiserror = { workspace = true }
 bytes = { workspace = true }
-codec = { package = "parity-scale-codec", workspace = true, features = ["derive"] }
+codec = { workspace = true }
 primitive-types = { workspace = true, default-features = false, features = ["codec", "scale-info", "serde"] }
 hex = { workspace = true }
 schnorrkel = "0.11.4"
@@ -40,7 +40,7 @@ litep2p = { workspace = true }
 multiaddr ={ workspace = true }
 multihash = { workspace = true, default-features = false }
 
-libp2p = { version = "0.54", features = ["dns", "identify", "kad", "macros", "mdns", "noise", "ping", "tcp",  "tokio", "yamux", "websocket", "request-response"] }
+libp2p = { workspace = true }
 libp2p-identity = { features = ["ed25519", "peerid", "rand"], workspace = true }
 libp2p-tls = { workspace = true }
 libp2p-noise = { workspace = true }

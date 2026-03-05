@@ -9,24 +9,21 @@ use jsonrpsee::{
 };
 use libp2p::{
     identify::Info,
-    identity::Keypair,
-    kad::{record::Key as KademliaKey, GetRecordOk, KademliaEvent, QueryId, QueryResult},
-    multiaddr,
-    swarm::{DialError, SwarmEvent},
+    kad::{Event as KademliaEvent, GetRecordOk, QueryId, QueryResult, RecordKey as KademliaKey},
+    swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
-use multihash_codetable::{Code, MultihashDigest};
 use rand::{seq::SliceRandom, thread_rng};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use subp2p_explorer::{
     peer_behavior::PeerInfoEvent,
-    transport::{TransportBuilder, MIB},
     util::authorities::{decode_dht_record, hash_authority_id},
     util::crypto::sr25519,
     util::p2p::get_peer_id,
-    util::ss58::{ss58hash, to_ss58},
+    util::ss58::to_ss58,
     Behaviour, BehaviourEvent,
 };
 
@@ -39,11 +36,178 @@ pub async fn client(url: Url) -> Result<Client, Box<dyn std::error::Error>> {
         .build_with_tokio(sender, receiver))
 }
 
+/// Fetch bootnodes from the chain spec via the RPC endpoint.
+///
+/// Calls `sync_state_genSyncSpec` to retrieve the full chain spec and extracts
+/// the `bootNodes` array.
+pub(crate) async fn fetch_bootnodes_from_rpc(
+    url: Url,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let client = client(url).await?;
+
+    let spec: serde_json::Value = client
+        .request("sync_state_genSyncSpec", rpc_params![true])
+        .await?;
+
+    let bootnodes = spec
+        .get("bootNodes")
+        .ok_or("Chain spec missing `bootNodes` field")?
+        .as_array()
+        .ok_or("Invalid `bootNodes` format, expected array")?
+        .iter()
+        .filter_map(|node| node.as_str().map(|s| s.to_string()))
+        .collect();
+
+    Ok(bootnodes)
+}
+
+/// Known chains whose published chainspecs are available at
+/// `https://paritytech.github.io/chainspecs/{chain}/relaychain/chainspec.json`.
+const KNOWN_CHAINS: &[&str] = &["kusama", "paseo", "westend", "polkadot"];
+
+/// Detect a known chain name from the RPC URL.
+///
+/// Checks both the hostname and path for "kusama", "paseo", "westend",
+/// "polkadot" (in that order — kusama before polkadot because
+/// `kusama-rpc.polkadot.io` contains both). This also handles URLs like
+/// `wss://rpc.ibp.network/paseo` where the chain name is in the path.
+pub fn detect_chain_name(url: &Url) -> Option<&'static str> {
+    let host = url.host_str().unwrap_or("");
+    let path = url.path();
+    KNOWN_CHAINS
+        .iter()
+        .find(|&&chain| host.contains(chain) || path.contains(chain))
+        .copied()
+}
+
+/// Fetch bootnodes from a published chainspec for a known chain.
+///
+/// Downloads `https://paritytech.github.io/chainspecs/{chain}/relaychain/chainspec.json`
+/// and extracts the `bootNodes` array.
+pub(crate) async fn fetch_bootnodes_from_chainspec(
+    chain: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://paritytech.github.io/chainspecs/{}/relaychain/chainspec.json",
+        chain
+    );
+    let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
+    let bootnodes = resp
+        .get("bootNodes")
+        .ok_or("Published chainspec missing `bootNodes` field")?
+        .as_array()
+        .ok_or("Invalid `bootNodes` format, expected array")?
+        .iter()
+        .filter_map(|node| node.as_str().map(|s| s.to_string()))
+        .collect();
+    Ok(bootnodes)
+}
+
+/// Resolve bootnodes by combining CLI-provided, RPC-fetched, and published chainspec sources.
+///
+/// 1. Uses CLI bootnodes if provided, otherwise fetches from RPC.
+/// 2. If a known chain is detected from the RPC URL, also downloads published chainspec bootnodes.
+/// 3. Merges and deduplicates all bootnodes (exact string match).
+///
+/// Chainspec download failures are logged as warnings and do not abort the process.
+pub(crate) async fn resolve_bootnodes(
+    rpc_url: &Url,
+    cli_bootnodes: Vec<String>,
+    w: &mut impl Write,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut bootnodes = if cli_bootnodes.is_empty() {
+        writeln!(
+            w,
+            "       No bootnodes provided, fetching from chain spec via RPC..."
+        )?;
+        let fetched = fetch_bootnodes_from_rpc(rpc_url.clone()).await?;
+        writeln!(w, "       Fetched {} bootnodes from RPC", fetched.len())?;
+        fetched
+    } else {
+        cli_bootnodes
+    };
+
+    if let Some(chain) = detect_chain_name(rpc_url) {
+        writeln!(
+            w,
+            "       Detected known chain \"{}\", downloading published chainspec bootnodes...",
+            chain
+        )?;
+        match fetch_bootnodes_from_chainspec(chain).await {
+            Ok(extra) => {
+                let unique_peers: HashSet<_> = extra
+                    .iter()
+                    .filter_map(|addr| addr.rsplit("/p2p/").next())
+                    .collect();
+                writeln!(
+                    w,
+                    "       Fetched from chainspec online {} addresses and {} bootnodes",
+                    extra.len(),
+                    unique_peers.len()
+                )?;
+                let mut seen: HashSet<String> = bootnodes.drain(..).collect();
+                let before = seen.len();
+                seen.extend(extra);
+                writeln!(
+                    w,
+                    "       Merged to {} unique addresses ({} new from chainspec)",
+                    seen.len(),
+                    seen.len() - before
+                )?;
+                bootnodes = seen.into_iter().collect();
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to fetch published chainspec bootnodes for {}: {}",
+                    chain,
+                    e
+                );
+                writeln!(
+                    w,
+                    "       Warning: could not fetch published chainspec bootnodes: {}",
+                    e
+                )?;
+            }
+        }
+    }
+
+    writeln!(w)?;
+    Ok(bootnodes)
+}
+
+/// Fetch the genesis hash from the RPC endpoint.
+///
+/// Calls `chain_getBlockHash(0)` and returns the hex-encoded hash (without `0x` prefix).
+pub(crate) async fn fetch_genesis_hash(url: Url) -> Result<String, Box<dyn std::error::Error>> {
+    let client = client(url).await?;
+
+    let hash: String = client
+        .request("chain_getBlockHash", rpc_params![0u32])
+        .await?;
+
+    Ok(hash.trim_start_matches("0x").to_string())
+}
+
+/// Fetch the SS58 address prefix from the RPC endpoint via `system_properties`.
+pub(crate) async fn fetch_ss58_prefix(url: Url) -> Result<u16, Box<dyn std::error::Error>> {
+    let client = client(url).await?;
+
+    let props: serde_json::Value = client.request("system_properties", rpc_params![]).await?;
+
+    let prefix = props
+        .get("ss58Format")
+        .ok_or("system_properties missing `ss58Format` field")?
+        .as_u64()
+        .ok_or("Invalid `ss58Format`, expected integer")? as u16;
+
+    Ok(prefix)
+}
+
 /// Call the runtime API of the target node to retrive the current set
 /// of authorities.
 ///
 /// This method calls into `AuthorityDiscoveryApi_authorities` runtime API.
-async fn runtime_api_autorities(
+pub(crate) async fn runtime_api_autorities(
     url: Url,
 ) -> Result<Vec<sr25519::PublicKey>, Box<dyn std::error::Error>> {
     let client = client(url).await?;
@@ -59,14 +223,14 @@ async fn runtime_api_autorities(
         .strip_prefix("0x")
         .expect("Substrate API returned invalid hex");
 
-    let bytes = hex::decode(&raw)?;
+    let bytes = hex::decode(raw)?;
 
     let authorities: Vec<sr25519::PublicKey> = Decode::decode(&mut &bytes[..])?;
     Ok(authorities)
 }
 
 /// The maximum number of Kademlia `get-records` queried a time.
-const MAX_QUERIES: usize = 8;
+const MAX_QUERIES: usize = 128;
 
 /// Discover the authorities on the network.
 pub struct AuthorityDiscovery {
@@ -105,6 +269,13 @@ pub struct AuthorityDiscovery {
     interval_resubmit: tokio::time::Interval,
     /// Interval at which to bail out.
     interval_exit: tokio::time::Interval,
+
+    /// Whether to print an interactive progress bar to stdout.
+    show_progress: bool,
+    /// When the discovery process started.
+    start_time: std::time::Instant,
+    /// Timeout duration for display purposes.
+    timeout_secs: u64,
 }
 
 /// The peer details extracted from the DHT.
@@ -118,10 +289,12 @@ pub struct PeerDetails {
 }
 
 impl PeerDetails {
+    #[allow(dead_code)]
     pub fn addresses(&self) -> &HashSet<Multiaddr> {
         &self.addresses
     }
 
+    #[allow(dead_code)]
     pub fn authority_id(&self) -> &sr25519::PublicKey {
         &self.authority_id
     }
@@ -153,8 +326,12 @@ impl AuthorityDiscovery {
             finished_query: false,
 
             old_log: std::time::Instant::now(),
-            interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(60)),
+            interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(15)),
             interval_exit: tokio::time::interval(timeout),
+
+            show_progress: false,
+            start_time: std::time::Instant::now(),
+            timeout_secs: timeout.as_secs(),
         }
     }
 
@@ -166,7 +343,7 @@ impl AuthorityDiscovery {
             self.records_keys.insert(key.clone(), authority);
 
             let id = self.swarm.behaviour_mut().discovery.get_record(key);
-            self.queries.insert(id, authority.clone());
+            self.queries.insert(id, authority);
         }
     }
 
@@ -198,24 +375,39 @@ impl AuthorityDiscovery {
     /// After one query is submitted for every authority this method will
     /// resubmit the DHT queries for the remaining authorities.
     fn advance_dht_queries(&mut self) {
-        // Add more DHT queries.
+        // Add more DHT queries from the initial authority list.
         while self.queries.len() < MAX_QUERIES {
             if let Some(next) = self.authorities.get(self.query_index) {
-                self.query_dht_records(std::iter::once(next.clone()));
+                self.query_dht_records(std::iter::once(*next));
                 self.query_index += 1;
             } else {
-                if self.queries.is_empty() {
-                    self.resubmit_remaining_dht_queries();
-                }
-                log::debug!(
-                    "queries: {} remaining authorities to discover {}",
-                    self.queries.len(),
-                    self.remaining_authorities.len()
-                );
-
                 break;
             }
         }
+
+        // Backfill empty slots with remaining (not-yet-found) authorities
+        // so that slots freed by completed queries are reused immediately
+        // instead of waiting for the periodic resubmit timer.
+        if self.query_index >= self.authorities.len() && self.queries.len() < MAX_QUERIES {
+            let in_flight: HashSet<_> = self.queries.values().copied().collect();
+            let backfill: Vec<_> = self
+                .remaining_authorities
+                .iter()
+                .filter(|a| !in_flight.contains(*a))
+                .take(MAX_QUERIES - self.queries.len())
+                .copied()
+                .collect();
+
+            if !backfill.is_empty() {
+                self.query_dht_records(backfill);
+            }
+        }
+
+        log::debug!(
+            "queries: {} remaining authorities to discover {}",
+            self.queries.len(),
+            self.remaining_authorities.len()
+        );
 
         self.query_peer_info();
     }
@@ -248,10 +440,12 @@ impl AuthorityDiscovery {
     }
 
     /// Handle a swarm event from the p2p network.
-    fn handle_swarm<T>(&mut self, event: SwarmEvent<BehaviourEvent, T>) {
+    fn handle_swarm(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
             // Discovery DHT record.
             SwarmEvent::Behaviour(behavior_event) => {
+                log::trace!("Behaviour event: {:?}", behavior_event);
+
                 match behavior_event {
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
                         id,
@@ -261,80 +455,99 @@ impl AuthorityDiscovery {
                         // Has received at least one answer for this and can advance the queries.
                         self.queries.remove(&id);
 
-                        match record {
-                            Ok(GetRecordOk::FoundRecord(peer_record)) => {
-                                let key = peer_record.record.key;
-                                let value = peer_record.record.value;
+                        if let Ok(GetRecordOk::FoundRecord(peer_record)) = record {
+                            let key = peer_record.record.key;
+                            let value = peer_record.record.value;
 
-                                let Some(authority) = self.records_keys.get(&key) else {
+                            let Some(authority) = self.records_keys.get(&key) else {
+                                self.advance_dht_queries();
+                                return;
+                            };
+                            let authority = *authority;
+
+                            let (peer_id, addresses) = match decode_dht_record(value, &authority) {
+                                Ok((peer_id, addresses)) => (peer_id, addresses),
+                                Err(e) => {
+                                    log::debug!(
+                                        " Decoding DHT failed for authority {:?}: {:?}",
+                                        authority,
+                                        e
+                                    );
+                                    self.dht_errors += 1;
+                                    self.advance_dht_queries();
                                     return;
-                                };
-                                let authority = *authority;
+                                }
+                            };
 
-                                let (peer_id, addresses) =
-                                    match decode_dht_record(value, &authority) {
-                                        Ok((peer_id, addresses)) => (peer_id, addresses),
-                                        Err(e) => {
-                                            log::debug!(
-                                                " Decoding DHT failed for authority {:?}: {:?}",
-                                                authority,
-                                                e
-                                            );
-                                            self.dht_errors += 1;
-                                            return;
-                                        }
-                                    };
+                            self.authority_to_details
+                                .entry(authority)
+                                .and_modify(|entry| entry.extend(addresses.clone()))
+                                .or_insert_with(|| addresses.iter().cloned().collect());
 
-                                self.authority_to_details
-                                    .entry(authority)
-                                    .and_modify(|entry| entry.extend(addresses.clone()))
-                                    .or_insert_with(|| addresses.iter().cloned().collect());
+                            self.peer_details
+                                .entry(peer_id)
+                                .and_modify(|entry| entry.addresses.extend(addresses.clone()))
+                                .or_insert_with(|| PeerDetails {
+                                    authority_id: authority,
+                                    addresses: addresses.iter().cloned().collect(),
+                                });
 
-                                self.peer_details
-                                    .entry(peer_id)
-                                    .and_modify(|entry| entry.addresses.extend(addresses.clone()))
-                                    .or_insert_with(|| PeerDetails {
-                                        authority_id: authority,
-                                        addresses: addresses.iter().cloned().collect(),
-                                    });
+                            // Dial the peer so the identify protocol can run.
+                            if !self.peer_info.contains_key(&peer_id) {
+                                for addr in &addresses {
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .discovery
+                                        .add_address(&peer_id, addr.clone());
+                                }
+                                let _ = self.swarm.dial(peer_id);
+                            }
 
-                                log::debug!(
-                                    "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",
+                            log::debug!(
+                                "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",
+                                self.authority_to_details.len(),
+                                self.authorities.len(),
+                                self.dht_errors,
+                                authority,
+                                peer_id,
+                                addresses
+                            );
+
+                            let now = std::time::Instant::now();
+                            if now.duration_since(self.old_log) > std::time::Duration::from_secs(10)
+                            {
+                                self.old_log = now;
+                                log::info!(
+                                    "... DHT records {}/{} (err {}) | Identified {}/{} | Active peer queries {} | authority={:?} peer_id={:?} addresses={:?}",
                                     self.authority_to_details.len(),
                                     self.authorities.len(),
                                     self.dht_errors,
+
+                                    self.peer_details.keys().filter_map(|peer| self.peer_info.get(peer)).count(),
+                                    self.peer_details.keys().count(),
+
+                                    self.queries_discovery.len(),
+
                                     authority,
                                     peer_id,
                                     addresses
                                 );
-
-                                let now = std::time::Instant::now();
-                                if now.duration_since(self.old_log)
-                                    > std::time::Duration::from_secs(10)
-                                {
-                                    self.old_log = now;
-                                    log::info!(
-                                        "... DHT records {}/{} (err {}) | Identified {}/{} | Active peer queries {} | authority={:?} peer_id={:?} addresses={:?}",
-                                        self.authority_to_details.len(),
-                                        self.authorities.len(),
-                                        self.dht_errors,
-
-                                        self.peer_details.keys().filter_map(|peer| self.peer_info.get(peer)).count(),
-                                        self.peer_details.keys().count(),
-
-                                        self.queries_discovery.len(),
-
-                                        authority,
-                                        peer_id,
-                                        addresses
-                                    );
-                                }
-
-                                self.remaining_authorities.remove(&authority);
-                                self.advance_dht_queries();
                             }
-                            _ => (),
+
+                            self.remaining_authorities.remove(&authority);
+                        } else {
+                            log::debug!(
+                                "DHT query failed: {:?} (in-flight: {}, remaining: {})",
+                                record.err(),
+                                self.queries.len(),
+                                self.remaining_authorities.len()
+                            );
                         }
+
+                        // Always advance queries regardless of success or failure,
+                        // otherwise failed queries reduce concurrency without replacement
+                        // and the discovery stalls until the resubmit timer fires.
+                        self.advance_dht_queries();
                     }
 
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
@@ -377,17 +590,140 @@ impl AuthorityDiscovery {
                 }
             }
 
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                ..
+            } => {
+                log::trace!(
+                    "Connection closed: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    num_established,
+                );
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                ..
+            } => {
+                log::trace!(
+                    "Connection established: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    num_established,
+                );
+            }
+
+            SwarmEvent::Dialing {
+                peer_id,
+                connection_id,
+            } => {
+                log::trace!(
+                    "Dialing: peer_id={:?} connection_id={:?}",
+                    peer_id,
+                    connection_id,
+                );
+            }
+
+            SwarmEvent::OutgoingConnectionError {
+                connection_id,
+                peer_id,
+                error,
+            } => {
+                log::trace!(
+                    "Outgoing connection error: peer_id={:?} connection_id={:?} error={:?}",
+                    peer_id,
+                    connection_id,
+                    error,
+                );
+            }
+
+            SwarmEvent::IncomingConnectionError {
+                connection_id,
+                local_addr,
+                send_back_addr,
+                error,
+                ..
+            } => {
+                log::trace!(
+                    "Incoming connection error: connection_id={:?} local_addr={:?} send_back_addr={:?} error={:?}",
+                    connection_id,
+                    local_addr,
+                    send_back_addr,
+                    error,
+                );
+            }
+
             _ => (),
         }
+    }
+
+    /// Enable or disable interactive progress bar output on stdout.
+    pub fn set_show_progress(&mut self, show: bool) {
+        self.show_progress = show;
+    }
+
+    /// Print an in-place progress bar to stdout.
+    fn print_progress(&self) {
+        let elapsed = self.start_time.elapsed().as_secs();
+        let total = self.authorities.len();
+        let found = self.authority_to_details.len();
+        let identified = self
+            .peer_details
+            .keys()
+            .filter(|peer| self.peer_info.contains_key(peer))
+            .count();
+
+        let pct = if total > 0 {
+            found as f64 / total as f64
+        } else {
+            0.0
+        };
+        let bar_width = 25;
+        let filled = (pct * bar_width as f64) as usize;
+        let bar = format!(
+            "{}{}",
+            "\u{2588}".repeat(filled),
+            "\u{2591}".repeat(bar_width - filled)
+        );
+
+        let connected_peers = self.swarm.connected_peers().count();
+        let queries_inflight = self.queries.len();
+
+        print!(
+            "\r       [{}] {}/{} ({:.1}%) | Identified: {} | Errors: {} | Peers: {} | Queries: {} | {}s/{}s   ",
+            bar,
+            found,
+            total,
+            pct * 100.0,
+            identified,
+            self.dht_errors,
+            connected_peers,
+            queries_inflight,
+            elapsed,
+            self.timeout_secs,
+        );
+        let _ = std::io::stdout().flush();
     }
 
     /// Run the discovery process.
     pub async fn discover(&mut self) {
         self.advance_dht_queries();
+        self.start_time = std::time::Instant::now();
 
         // Should return immediately.
         self.interval_resubmit.tick().await;
         self.interval_exit.tick().await;
+
+        let mut progress_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        progress_interval.tick().await;
 
         loop {
             futures::select! {
@@ -399,7 +735,19 @@ impl AuthorityDiscovery {
                     self.resubmit_remaining_dht_queries();
                 }
 
+                _ = progress_interval.tick().fuse() => {
+                    if self.show_progress {
+                        self.print_progress();
+                    }
+                }
+
                 _ = self.interval_exit.tick().fuse() => {
+                    if self.show_progress {
+                        // Clear the progress line.
+                        print!("\r{}\r", " ".repeat(100));
+                        let _ = std::io::stdout().flush();
+                    }
+
                     if self.authority_to_details.len() == self.authorities.len() {
                         log::info!("All authorities discovered from DHT");
                     } else {
@@ -413,19 +761,36 @@ impl AuthorityDiscovery {
     }
 
     /// Returns a reference to the discovered peer details.
+    #[allow(dead_code)]
     pub fn peer_details(&self) -> &HashMap<PeerId, PeerDetails> {
         &self.peer_details
     }
 
     /// Returns a reference to the discovered peer info.
+    #[allow(dead_code)]
     pub fn peer_info(&self) -> &HashMap<PeerId, Info> {
         &self.peer_info
     }
 
     /// Returns a reference to the mapping between the authority discovery public key and the
     /// discovered addresses.
+    #[allow(dead_code)]
     pub fn authority_to_details(&self) -> &HashMap<sr25519::PublicKey, HashSet<Multiaddr>> {
         &self.authority_to_details
+    }
+
+    /// Consume the discovery state and return the collected results.
+    ///
+    /// This drops the underlying swarm, freeing its network connections and
+    /// file descriptors so that subsequent phases (e.g. TCP reachability
+    /// checks) do not hit the open-file limit.
+    pub fn into_results(
+        self,
+    ) -> (
+        HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
+        HashMap<PeerId, Info>,
+    ) {
+        (self.authority_to_details, self.peer_info)
     }
 }
 
@@ -446,52 +811,53 @@ impl AuthorityDiscovery {
 /// let info = info.discover().await;
 /// println!("Peer={:?} version={:?}", peer_id, info);
 /// ```
-#[allow(unused)]
+#[allow(dead_code)]
 struct PeerInfo {
     swarm: Swarm<libp2p::identify::Behaviour>,
 }
 
+#[allow(dead_code)]
 impl PeerInfo {
-    #[allow(unused)]
-    pub fn new(local_key: Keypair, addresses: Vec<Multiaddr>) -> Self {
-        // "/ip4/144.76.115.244/tcp/30333/p2p/12D3KooWKR7TX55EnZ6L6FUHfuZKAEgkL8ffE3KFYqnHZUysSVrW"
-        let mut swarm: Swarm<libp2p::identify::Behaviour> = {
-            let transport = TransportBuilder::new()
-                .yamux_maximum_buffer_size(256 * MIB)
-                .build(local_key.clone());
+    pub async fn new(local_key: libp2p::identity::Keypair, addresses: Vec<Multiaddr>) -> Self {
+        let identify_config =
+            libp2p::identify::Config::new("/substrate/1.0".to_string(), local_key.public())
+                .with_agent_version("subp2p-identify".to_string())
+                .with_cache_size(0);
+        let identify = libp2p::identify::Behaviour::new(identify_config);
 
-            let identify_config =
-                libp2p::identify::Config::new("/substrate/1.0".to_string(), local_key.public())
-                    .with_agent_version("subp2p-identify".to_string())
-                    // Do not cache peer info.
-                    .with_cache_size(0);
-            let identify = libp2p::identify::Behaviour::new(identify_config);
+        let tcp_config = libp2p::tcp::Config::new().nodelay(true);
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp_config,
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .expect("Can construct TCP; qed")
+            .with_dns()
+            .expect("Can construct DNS; qed")
+            .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+            .await
+            .expect("Can construct WebSocket; qed")
+            .with_behaviour(|_key| identify)
+            .expect("Can construct behaviour; qed")
+            .build();
 
-            let local_peer_id = PeerId::from(local_key.public());
-            libp2p::swarm::SwarmBuilder::with_tokio_executor(transport, identify, local_peer_id)
-                .build()
-        };
-
-        // These are the initial peers for which the queries are performed against.
         for multiaddress in &addresses {
-            let res = swarm.dial(multiaddress.clone());
+            let _ = swarm.dial(multiaddress.clone());
         }
 
         PeerInfo { swarm }
     }
 
-    #[allow(unused)]
-    pub async fn discover(mut self) -> Result<Info, DialError> {
+    pub async fn discover(mut self) -> Result<Info, libp2p::swarm::DialError> {
         loop {
             let event = self.swarm.select_next_some().await;
 
             match event {
-                SwarmEvent::Behaviour(behavior) => match behavior {
-                    libp2p::identify::Event::Received { info, .. } => {
-                        return Ok(info);
-                    }
-                    _ => (),
-                },
+                SwarmEvent::Behaviour(libp2p::identify::Event::Received { info, .. }) => {
+                    return Ok(info);
+                }
 
                 SwarmEvent::OutgoingConnectionError { error, .. } => return Err(error),
 
@@ -509,6 +875,7 @@ pub async fn discover_authorities(
     timeout: std::time::Duration,
     address_format: String,
     raw_output: bool,
+    query_timeout: std::time::Duration,
 ) -> Result<(AuthorityDiscovery, Vec<sr25519::PublicKey>), Box<dyn std::error::Error>> {
     let format_registry =
         ss58_registry::Ss58AddressFormatRegistry::try_from(address_format.as_str())
@@ -529,7 +896,7 @@ pub async fn discover_authorities(
     // Perform DHT queries to find the authorities on the network.
     // Then, record the addresses of the authorities and the responses
     // from the identify protocol.
-    let swarm = build_swarm(genesis.clone(), bootnodes)?;
+    let swarm = build_swarm(genesis.clone(), bootnodes, query_timeout).await?;
     let mut authority_discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
     authority_discovery.discover().await;
     log::info!("Finished discovery\n");

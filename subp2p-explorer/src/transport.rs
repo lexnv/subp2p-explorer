@@ -26,6 +26,12 @@ pub struct TransportBuilder {
     yamux_maximum_buffer_size: usize,
 }
 
+impl Default for TransportBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransportBuilder {
     /// Create a new [`TransportBuilder`].
     pub fn new() -> TransportBuilder {
@@ -73,29 +79,19 @@ impl TransportBuilder {
         // The main transport is DNS(TCP).
         let tcp_config = tcp::Config::new().nodelay(true);
         let tcp_trans = tcp::tokio::Transport::new(tcp_config.clone());
-        let dns = dns::TokioDnsConfig::system(tcp_trans).expect("Can construct DNS; qed");
+        let dns = dns::tokio::Transport::system(tcp_trans).expect("Can construct DNS; qed");
 
         // Support for WS and WSS.
         let tcp_trans = tcp::tokio::Transport::new(tcp_config);
         let dns_for_wss =
-            dns::TokioDnsConfig::system(tcp_trans).expect("Valid config provided; qed");
+            dns::tokio::Transport::system(tcp_trans).expect("Valid config provided; qed");
 
-        let transport = websocket::WsConfig::new(dns_for_wss).or_transport(dns);
+        let transport = websocket::Config::new(dns_for_wss).or_transport(dns);
 
         let authentication_config =
             noise::Config::new(&keypair).expect("Can create noise config; qed");
 
-        let multiplexing_config = {
-            let mut yamux_config = libp2p::yamux::Config::default();
-
-            // Enable proper flow-control: window updates are only sent when
-            // buffered data has been consumed.
-            yamux_config.set_window_update_mode(libp2p::yamux::WindowUpdateMode::on_read());
-            yamux_config.set_max_buffer_size(self.yamux_maximum_buffer_size);
-            yamux_config.set_receive_window_size(self.yamux_window_size);
-
-            yamux_config
-        };
+        let multiplexing_config = libp2p::yamux::Config::default();
 
         transport
             .upgrade(upgrade::Version::V1Lazy)

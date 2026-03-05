@@ -5,14 +5,14 @@
 use std::time::Duration;
 
 use libp2p::{
-    kad::{store::MemoryStore, Kademlia, KademliaConfig},
+    kad::{self, store::MemoryStore},
     PeerId, StreamProtocol,
 };
 
 /// Discovery protocol of the p2p network.
 ///
 /// The main discovery protocol used by substrate chains is Kademlia.
-pub type Discovery = Kademlia<MemoryStore>;
+pub type Discovery = kad::Behaviour<MemoryStore>;
 
 /// Builder for the discovery protocol (Kademlia).
 pub struct DiscoveryBuilder {
@@ -26,14 +26,20 @@ pub struct DiscoveryBuilder {
     query_timeout: Duration,
 }
 
+impl Default for DiscoveryBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiscoveryBuilder {
     /// Create a new [`DiscoveryBuilder`].
     pub fn new() -> DiscoveryBuilder {
         DiscoveryBuilder {
-            max_packet_size: 8192,
+            max_packet_size: 16 * 1024 * 1024,
             record_ttl: None,
             provider_ttl: None,
-            query_timeout: Duration::from_secs(60),
+            query_timeout: Duration::from_secs(15),
         }
     }
 
@@ -59,7 +65,7 @@ impl DiscoveryBuilder {
 
     /// Sets the timeout for a single query.
     ///
-    /// Default: 60 seconds.
+    /// Default: 15 seconds.
     pub fn query_timeout(mut self, query_timeout: Duration) -> Self {
         self.query_timeout = query_timeout;
         self
@@ -67,22 +73,17 @@ impl DiscoveryBuilder {
 
     /// Build the discovery protocol.
     pub fn build(self, local_peer_id: PeerId, genesis_hash: &str) -> Discovery {
-        let mut config = KademliaConfig::default();
+        let kademlia_protocol = StreamProtocol::try_from_owned(format!("/{genesis_hash}/kad"))
+            .expect("Protocol name starts with '/'; qed");
+
+        let mut config = kad::Config::new(kademlia_protocol);
         config.set_max_packet_size(self.max_packet_size);
         config.set_record_ttl(self.record_ttl);
         config.set_provider_record_ttl(self.provider_ttl);
         config.set_query_timeout(self.query_timeout);
 
-        // Support only the genesis protocol for kademlia.
-        let kademlia_protocols =
-            vec![
-                StreamProtocol::try_from_owned(format!("/{genesis_hash}/kad"))
-                    .expect("Protocol name starts with '/'; qed"),
-            ];
-        config.set_protocol_names(kademlia_protocols.into_iter().map(Into::into).collect());
-
         // Use memory store for kad.
         let store = MemoryStore::new(local_peer_id);
-        Kademlia::with_config(local_peer_id, store, config)
+        kad::Behaviour::with_config(local_peer_id, store, config)
     }
 }

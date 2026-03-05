@@ -7,15 +7,20 @@ mod utils;
 
 use clap::Parser as ClapParser;
 use commands::{
-    authorities::discover_authorities, bootnodes::verify_bootnodes, discovery::discover_network,
+    authorities::{discover_authorities, resolve_bootnodes},
+    authority_check::check_authorities,
+    bootnodes::verify_bootnodes,
+    discovery::discover_network,
     extrinsics::submit_extrinsics,
 };
+use jsonrpsee::client_transport::ws::Url;
 use std::{error::Error, io::Read, path::PathBuf};
 
 /// Command for interacting with the CLI.
 #[derive(Debug, ClapParser)]
 enum Command {
     Authorities(Authorities),
+    AuthorityCheck(AuthorityCheckOpts),
     SendExtrinisic(SendExtrinisicOpts),
     DiscoverNetwork(DiscoverNetworkOpts),
     VerifyBootnodes(BootnodesOpts),
@@ -51,6 +56,61 @@ pub struct Authorities {
     /// Print the raw identity list of discovered peers.
     #[clap(long, short)]
     raw_output: bool,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
+}
+
+/// Check authority health: discover DHT records, test connectivity per address,
+/// and report per-authority and global statistics.
+#[derive(Debug, ClapParser)]
+pub struct AuthorityCheckOpts {
+    /// The URL of the chain RPC endpoint.
+    #[clap(long, short)]
+    url: String,
+    /// Hex-encoded genesis hash of the chain.
+    ///
+    /// If not provided, the genesis hash is fetched from the RPC endpoint.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
+    ///
+    /// If not provided, bootnodes are fetched from the chain spec via the RPC endpoint.
+    #[clap(long, use_value_delimiter = true, value_parser)]
+    bootnodes: Vec<String>,
+    /// The number of seconds for DHT discovery.
+    #[clap(long, short, value_parser = parse_duration)]
+    timeout: std::time::Duration,
+    /// The number of seconds to wait for each individual TCP connection check.
+    #[clap(long, short = 'd', default_value = "10", value_parser = parse_duration)]
+    dial_timeout: std::time::Duration,
+    /// The address format name of the chain (e.g., "polkadot", "kusama").
+    ///
+    /// If not provided, the SS58 prefix is fetched from the RPC endpoint.
+    #[clap(long, short)]
+    address_format: Option<String>,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
+    /// The RPC endpoint of the chain that hosts on-chain identities
+    /// (e.g., the People parachain `wss://polkadot-people-rpc.polkadot.io`).
+    ///
+    /// When provided, authority display names are resolved from the Identity
+    /// pallet on that chain. If omitted, identities are looked up on the
+    /// relay chain itself.
+    #[clap(long)]
+    identity_rpc: Option<String>,
+    /// Show only authorities that have failures (no DHT record, unreachable
+    /// public addresses, or no public addresses at all).
+    #[clap(long)]
+    show_failing_only: bool,
+    /// Write the full results as a JSON report to the given file path.
+    #[clap(long)]
+    json: Option<PathBuf>,
 }
 
 /// Send extrinsic on the p2p network.
@@ -96,6 +156,11 @@ pub struct DiscoverNetworkOpts {
     /// The number of seconds the discovery process should run for.
     #[clap(long, short, value_parser = parse_duration)]
     timeout: std::time::Duration,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -183,20 +248,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.raw_geolocation,
                 opts.only_authorities,
                 opts.timeout,
+                opts.query_timeout,
             )
             .await
         }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
+            let rpc_url = Url::parse(&opts.url)?;
+            let bootnodes =
+                resolve_bootnodes(&rpc_url, opts.bootnodes, &mut std::io::stdout()).await?;
             discover_authorities(
+                opts.url,
+                opts.genesis,
+                bootnodes,
+                opts.timeout,
+                opts.address_format,
+                opts.raw_output,
+                opts.query_timeout,
+            )
+            .await
+            .map(|_| ())
+        }
+        Command::AuthorityCheck(opts) => {
+            check_authorities(
                 opts.url,
                 opts.genesis,
                 opts.bootnodes,
                 opts.timeout,
+                opts.dial_timeout,
                 opts.address_format,
-                opts.raw_output,
+                opts.query_timeout,
+                opts.identity_rpc,
+                opts.show_failing_only,
+                opts.json,
             )
-            .await.map(|_|())
+            .await
         }
     }
 }

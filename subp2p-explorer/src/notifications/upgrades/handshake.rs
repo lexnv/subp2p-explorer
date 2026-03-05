@@ -26,7 +26,7 @@
 use asynchronous_codec::Framed;
 use bytes::BytesMut;
 use futures::prelude::*;
-use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
+use libp2p::core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use unsigned_varint::codec::UviBytes;
 
 const LOG_TARGET: &str = "subp2p-upgrades";
@@ -403,7 +403,13 @@ where
                 negotiated_name
             );
 
-            upgrade::write_length_prefixed(&mut socket, &self.handshake).await?;
+            {
+                let mut buf = unsigned_varint::encode::usize_buffer();
+                let encoded_len = unsigned_varint::encode::usize(self.handshake.len(), &mut buf);
+                socket.write_all(encoded_len).await?;
+                socket.write_all(&self.handshake).await?;
+                socket.flush().await?;
+            }
 
             log::trace!(
                 target: LOG_TARGET,

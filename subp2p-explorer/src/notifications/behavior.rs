@@ -170,6 +170,7 @@ impl NetworkBehaviour for Notifications {
         peer: libp2p::PeerId,
         addr: &libp2p::Multiaddr,
         _role_override: libp2p::core::Endpoint,
+        _port_use: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         log::debug!(target: LOG_TARGET, "Notifications new outbound for peer={:?}", peer);
 
@@ -178,6 +179,7 @@ impl NetworkBehaviour for Notifications {
             ConnectedPoint::Dialer {
                 role_override: Endpoint::Dialer,
                 address: addr.clone(),
+                port_use: libp2p::core::transport::PortUse::Reuse,
             },
             self.data.clone(),
         );
@@ -185,7 +187,7 @@ impl NetworkBehaviour for Notifications {
         Ok(handler)
     }
 
-    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm<Self::ConnectionHandler>) {
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
         match event {
             libp2p::swarm::FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id,
@@ -334,7 +336,6 @@ impl NetworkBehaviour for Notifications {
     fn poll(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        _params: &mut impl libp2p::swarm::PollParameters,
     ) -> std::task::Poll<ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
         self.waker = Some(cx.waker().clone());
 
