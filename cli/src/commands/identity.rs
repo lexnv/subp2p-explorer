@@ -330,7 +330,7 @@ pub async fn fetch_identity_names(
     let mut missing_stashes: Vec<[u8; 32]> = Vec::new();
     for (stash, hex_key) in unique_stashes.iter().zip(identity_keys.iter()) {
         if let Some(value) = identity_values.get(hex_key) {
-            if let Some(display) = decode_display_name(value) 
+            if let Some(display) = decode_display_name(value) {
                 if let Some(auths) = stash_to_auth.get(stash) {
                     for auth in auths {
                         names.insert(*auth, display.clone());

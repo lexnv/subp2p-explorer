@@ -3,7 +3,9 @@
 // see LICENSE for license details.
 
 use ip_network::IpNetwork;
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId, Swarm};
+use libp2p::{core::upgrade, identity, multiaddr::Protocol, Multiaddr, PeerId, Swarm, Transport};
+
+use crate::filtered_transport::FilteredTransport;
 use maxminddb::{geoip2::City, Reader as GeoIpReader};
 use primitive_types::H256;
 use std::error::Error;
@@ -120,19 +122,47 @@ pub async fn build_swarm(
 
     let tcp_config = libp2p::tcp::Config::new().nodelay(true);
 
+    // Build TCP transport with noise and yamux
+    let tcp_transport = libp2p::tcp::tokio::Transport::new(tcp_config.clone())
+        .upgrade(upgrade::Version::V1Lazy)
+        .authenticate(libp2p::noise::Config::new(&local_key).expect("noise config"))
+        .multiplex(libp2p::yamux::Config::default())
+        .boxed();
+
+    // Wrap with DNS resolution
+    let tcp_dns_transport = libp2p::dns::tokio::Transport::system(tcp_transport)
+        .expect("DNS transport")
+        .boxed();
+
+    // Wrap with our filter to block private IPs
+    let filtered_tcp = FilteredTransport::new(tcp_dns_transport).boxed();
+
+    // Build WebSocket transport
+    let ws_transport = libp2p::websocket::Config::new(
+        libp2p::dns::tokio::Transport::system(libp2p::tcp::tokio::Transport::new(tcp_config))
+            .expect("DNS for WS"),
+    )
+    .upgrade(upgrade::Version::V1Lazy)
+    .authenticate(libp2p::noise::Config::new(&local_key).expect("noise config ws"))
+    .multiplex(libp2p::yamux::Config::default())
+    .boxed();
+
+    // Wrap WebSocket with filter too
+    let filtered_ws = FilteredTransport::new(ws_transport).boxed();
+
+    // Combine transports
+    let transport = filtered_tcp
+        .or_transport(filtered_ws)
+        .map(|output, _| match output {
+            futures::future::Either::Left(o) => o,
+            futures::future::Either::Right(o) => o,
+        })
+        .boxed();
+
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
-        .with_tcp(
-            tcp_config,
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )
-        .expect("Can construct TCP; qed")
-        .with_dns()
-        .expect("Can construct DNS; qed")
-        .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
-        .await
-        .expect("Can construct WebSocket; qed")
+        .with_other_transport(|_key| transport)
+        .expect("Can construct transport; qed")
         .with_behaviour(|_key| Behaviour {
             notifications,
             peer_info,
