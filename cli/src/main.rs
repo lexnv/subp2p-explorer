@@ -3,6 +3,7 @@
 // see LICENSE for license details.
 
 mod commands;
+mod filtered_transport;
 mod utils;
 
 use clap::Parser as ClapParser;
