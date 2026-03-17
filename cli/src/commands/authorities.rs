@@ -1,4 +1,4 @@
-use crate::utils::build_swarm;
+use crate::utils::{build_swarm, is_public_address};
 use codec::Decode;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -493,14 +493,27 @@ impl AuthorityDiscovery {
                                 });
 
                             // Dial the peer so the identify protocol can run.
+                            // Only add public addresses to prevent connecting to private IPs.
                             if !self.peer_info.contains_key(&peer_id) {
+                                let mut has_public_addr = false;
                                 for addr in &addresses {
-                                    self.swarm
-                                        .behaviour_mut()
-                                        .discovery
-                                        .add_address(&peer_id, addr.clone());
+                                    if is_public_address(addr) {
+                                        self.swarm
+                                            .behaviour_mut()
+                                            .discovery
+                                            .add_address(&peer_id, addr.clone());
+                                        has_public_addr = true;
+                                    } else {
+                                        log::debug!(
+                                            "Skipping private address for peer {}: {}",
+                                            peer_id,
+                                            addr
+                                        );
+                                    }
                                 }
-                                let _ = self.swarm.dial(peer_id);
+                                if has_public_addr {
+                                    let _ = self.swarm.dial(peer_id);
+                                }
                             }
 
                             log::debug!(
@@ -586,6 +599,42 @@ impl AuthorityDiscovery {
                             }
                         };
                     }
+
+                    // Filter out private addresses learned from Kademlia peer exchange.
+                    BehaviourEvent::Discovery(KademliaEvent::RoutablePeer { peer, address }) => {
+                        if !is_public_address(&address) {
+                            log::debug!(
+                                "Removing private address from RoutablePeer {}: {}",
+                                peer,
+                                address
+                            );
+                            self.swarm
+                                .behaviour_mut()
+                                .discovery
+                                .remove_address(&peer, &address);
+                        }
+                    }
+
+                    BehaviourEvent::Discovery(KademliaEvent::RoutingUpdated {
+                        peer,
+                        addresses,
+                        ..
+                    }) => {
+                        for addr in addresses.iter() {
+                            if !is_public_address(addr) {
+                                log::debug!(
+                                    "Removing private address from RoutingUpdated {}: {}",
+                                    peer,
+                                    addr
+                                );
+                                self.swarm
+                                    .behaviour_mut()
+                                    .discovery
+                                    .remove_address(&peer, addr);
+                            }
+                        }
+                    }
+
                     _ => (),
                 }
             }
