@@ -8,9 +8,10 @@ use jsonrpsee::{
     rpc_params,
 };
 use libp2p::{
+    core::ConnectedPoint,
     identify::Info,
     kad::{Event as KademliaEvent, GetRecordOk, QueryId, QueryResult, RecordKey as KademliaKey},
-    swarm::SwarmEvent,
+    swarm::{DialError, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use rand::{seq::SliceRandom, thread_rng};
@@ -276,6 +277,11 @@ pub struct AuthorityDiscovery {
     start_time: std::time::Instant,
     /// Timeout duration for display purposes.
     timeout_secs: u64,
+
+    /// Per-address libp2p dial outcomes (noise + yamux + identify negotiation).
+    dial_outcomes: HashMap<Multiaddr, DialOutcome>,
+    /// Addresses for which a libp2p dial has been initiated.
+    dialed_addresses: HashSet<Multiaddr>,
 }
 
 /// The peer details extracted from the DHT.
@@ -298,6 +304,17 @@ impl PeerDetails {
     pub fn authority_id(&self) -> &sr25519::PublicKey {
         &self.authority_id
     }
+}
+
+/// Outcome of dialing a single address through the full libp2p stack
+/// (noise handshake, yamux multiplexing, identify negotiation).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", content = "reason")]
+pub enum DialOutcome {
+    /// Connection established successfully.
+    Success,
+    /// Dial failed with an error.
+    Failed(String),
 }
 
 impl AuthorityDiscovery {
@@ -332,6 +349,9 @@ impl AuthorityDiscovery {
             show_progress: false,
             start_time: std::time::Instant::now(),
             timeout_secs: timeout.as_secs(),
+
+            dial_outcomes: HashMap::with_capacity(4096),
+            dialed_addresses: HashSet::with_capacity(4096),
         }
     }
 
@@ -492,15 +512,27 @@ impl AuthorityDiscovery {
                                     addresses: addresses.iter().cloned().collect(),
                                 });
 
-                            // Dial the peer so the identify protocol can run.
-                            if !self.peer_info.contains_key(&peer_id) {
-                                for addr in &addresses {
-                                    self.swarm
-                                        .behaviour_mut()
-                                        .discovery
-                                        .add_address(&peer_id, addr.clone());
+                            // Add addresses to Kademlia for DHT routing.
+                            for addr in &addresses {
+                                self.swarm
+                                    .behaviour_mut()
+                                    .discovery
+                                    .add_address(&peer_id, addr.clone());
+                            }
+
+                            // Dial each address individually through the full libp2p
+                            // stack (noise handshake, yamux, identify) to test
+                            // reachability per address.
+                            for addr in &addresses {
+                                if !self.dialed_addresses.contains(addr) {
+                                    self.dialed_addresses.insert(addr.clone());
+                                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                                        self.dial_outcomes.insert(
+                                            addr.clone(),
+                                            DialOutcome::Failed(format!("{e}")),
+                                        );
+                                    }
                                 }
-                                let _ = self.swarm.dial(peer_id);
                             }
 
                             log::debug!(
@@ -612,6 +644,14 @@ impl AuthorityDiscovery {
                 num_established,
                 ..
             } => {
+                // Record successful dial outcome for addresses we initiated.
+                if let ConnectedPoint::Dialer { ref address, .. } = endpoint {
+                    if self.dialed_addresses.contains(address) {
+                        self.dial_outcomes
+                            .insert(address.clone(), DialOutcome::Success);
+                    }
+                }
+
                 log::trace!(
                     "Connection established: peer_id={:?} connection_id={:?} endpoint={:?} num_established={:?}",
                     peer_id,
@@ -637,6 +677,42 @@ impl AuthorityDiscovery {
                 peer_id,
                 error,
             } => {
+                // Record failed dial outcomes for addresses we initiated.
+                match &error {
+                    DialError::Transport(attempts) => {
+                        for (addr, transport_err) in attempts {
+                            if self.dialed_addresses.contains(addr) {
+                                self.dial_outcomes.insert(
+                                    addr.clone(),
+                                    DialOutcome::Failed(format!("{transport_err}")),
+                                );
+                            }
+                        }
+                    }
+                    DialError::WrongPeerId {
+                        obtained, address, ..
+                    } => {
+                        if self.dialed_addresses.contains(address) {
+                            self.dial_outcomes.insert(
+                                address.clone(),
+                                DialOutcome::Failed(format!("wrong peer ID: {obtained}")),
+                            );
+                        }
+                    }
+                    DialError::LocalPeerId { address } => {
+                        if self.dialed_addresses.contains(address) {
+                            self.dial_outcomes.insert(
+                                address.clone(),
+                                DialOutcome::Failed("dialed local peer ID".into()),
+                            );
+                        }
+                    }
+                    DialError::Denied { cause } => {
+                        log::trace!("Dial denied: {:?}", cause);
+                    }
+                    _ => {}
+                }
+
                 log::trace!(
                     "Outgoing connection error: peer_id={:?} connection_id={:?} error={:?}",
                     peer_id,
@@ -696,14 +772,26 @@ impl AuthorityDiscovery {
 
         let connected_peers = self.swarm.connected_peers().count();
         let queries_inflight = self.queries.len();
+        let dial_ok = self
+            .dial_outcomes
+            .values()
+            .filter(|o| matches!(o, DialOutcome::Success))
+            .count();
+        let dial_fail = self
+            .dial_outcomes
+            .values()
+            .filter(|o| matches!(o, DialOutcome::Failed(_)))
+            .count();
 
         print!(
-            "\r       [{}] {}/{} ({:.1}%) | Identified: {} | Errors: {} | Peers: {} | Queries: {} | {}s/{}s   ",
+            "\r       [{}] {}/{} ({:.1}%) | Id: {} | Dials: {}/{} ok | Err: {} | Peers: {} | Q: {} | {}s/{}s   ",
             bar,
             found,
             total,
             pct * 100.0,
             identified,
+            dial_ok,
+            dial_ok + dial_fail,
             self.dht_errors,
             connected_peers,
             queries_inflight,
@@ -789,8 +877,9 @@ impl AuthorityDiscovery {
     ) -> (
         HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
         HashMap<PeerId, Info>,
+        HashMap<Multiaddr, DialOutcome>,
     ) {
-        (self.authority_to_details, self.peer_info)
+        (self.authority_to_details, self.peer_info, self.dial_outcomes)
     }
 }
 

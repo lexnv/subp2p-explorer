@@ -4,7 +4,7 @@
 
 use crate::commands::authorities::{
     detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
-    runtime_api_autorities, AuthorityDiscovery,
+    runtime_api_autorities, AuthorityDiscovery, DialOutcome,
 };
 use crate::commands::identity::fetch_identity_names;
 use crate::utils::{build_swarm, is_public_address};
@@ -96,6 +96,12 @@ struct AddressCheck {
     address_short: String,
     is_public: bool,
     result: AddressResult,
+    /// Outcome of the full libp2p dial (noise + yamux + identify).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dial_outcome: Option<DialOutcome>,
+    /// Full multiaddress (not serialized, used for dial outcome lookup).
+    #[serde(skip_serializing)]
+    full_address: Option<Multiaddr>,
 }
 
 /// Aggregated result of checking a single authority.
@@ -125,6 +131,12 @@ struct GlobalStats {
     reachable_authorities: usize,
     fully_reachable_authorities: usize,
     agent_versions: HashMap<String, usize>,
+    /// Number of addresses where libp2p dial succeeded.
+    dial_success: usize,
+    /// Number of addresses where libp2p dial failed.
+    dial_failed: usize,
+    /// Number of addresses with no dial outcome (pending/not attempted).
+    dial_pending: usize,
 }
 
 /// Top-level JSON report containing all authority results and global statistics.
@@ -218,6 +230,8 @@ async fn run_connectivity_checks(
                         address_short,
                         is_public,
                         result,
+                        dial_outcome: None,
+                        full_address: Some(addr),
                     },
                 )
             })
@@ -323,13 +337,23 @@ fn print_authority_result(
             "private"
         };
 
-        let status = match &check.result {
+        let dial_status = match &check.dial_outcome {
+            Some(DialOutcome::Success) => "\x1b[32mOK\x1b[0m".to_string(),
+            Some(DialOutcome::Failed(e)) => format!("\x1b[31mFAIL\x1b[0m ({})", e),
+            None => "\x1b[33m-\x1b[0m".to_string(),
+        };
+
+        let tcp_status = match &check.result {
             AddressResult::Ok => "\x1b[32mOK\x1b[0m".to_string(),
             AddressResult::Failed(e) => format!("\x1b[31mFAIL\x1b[0m ({})", e),
             AddressResult::Skipped(r) => format!("\x1b[33mSKIP\x1b[0m ({})", r),
         };
 
-        writeln!(w, "    {} | {} | {}", addr, kind, status)?;
+        writeln!(
+            w,
+            "    {} | {} | Dial: {} | TCP: {}",
+            addr, kind, dial_status, tcp_status
+        )?;
     }
 
     let total = result.addresses.len();
@@ -403,6 +427,9 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
         reachable_authorities: 0,
         fully_reachable_authorities: 0,
         agent_versions: HashMap::new(),
+        dial_success: 0,
+        dial_failed: 0,
+        dial_pending: 0,
     };
 
     for r in results {
@@ -453,6 +480,12 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
                 }
             } else {
                 stats.private_addresses += 1;
+            }
+
+            match &a.dial_outcome {
+                Some(DialOutcome::Success) => stats.dial_success += 1,
+                Some(DialOutcome::Failed(_)) => stats.dial_failed += 1,
+                None => stats.dial_pending += 1,
             }
         }
     }
@@ -560,6 +593,27 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
         stats.unreachable_public,
         stats.public_addresses,
         pct(stats.unreachable_public, stats.public_addresses)
+    )?;
+    writeln!(w)?;
+
+    let dial_total = stats.dial_success + stats.dial_failed + stats.dial_pending;
+    writeln!(w, "  Libp2p Dials (noise + yamux + identify)")?;
+    writeln!(
+        w,
+        "  ├─ Connected:                    {:>6} ({})",
+        stats.dial_success,
+        pct(stats.dial_success, dial_total)
+    )?;
+    writeln!(
+        w,
+        "  ├─ Failed:                       {:>6} ({})",
+        stats.dial_failed,
+        pct(stats.dial_failed, dial_total)
+    )?;
+    writeln!(
+        w,
+        "  └─ Pending:                      {:>6}",
+        stats.dial_pending
     )?;
 
     if !stats.agent_versions.is_empty() {
@@ -707,7 +761,7 @@ pub async fn check_authorities(
 
     // Extract the results and drop the swarm so its network connections and
     // file descriptors are released before we open new TCP sockets in Phase 4.
-    let (authority_to_details, peer_info) = discovery.into_results();
+    let (authority_to_details, peer_info, dial_outcomes) = discovery.into_results();
 
     let dht_count = authority_to_details.len();
     let identified_authorities = authorities
@@ -726,6 +780,45 @@ pub async fn check_authorities(
         authorities.len(),
         identified_authorities,
         authorities.len(),
+    )?;
+
+    // Report libp2p dial results.
+    let dial_success = dial_outcomes
+        .values()
+        .filter(|o| matches!(o, DialOutcome::Success))
+        .count();
+    let dial_failed = dial_outcomes
+        .values()
+        .filter(|o| matches!(o, DialOutcome::Failed(_)))
+        .count();
+    let total_addrs: usize = authority_to_details.values().map(|a| a.len()).sum();
+    let dial_pending = total_addrs.saturating_sub(dial_outcomes.len());
+    writeln!(w)?;
+    writeln!(w, "       Libp2p dial results ({} addresses):", total_addrs)?;
+    writeln!(
+        w,
+        "       \u{251c}\u{2500} Connected:  {:>6} ({:.1}%)",
+        dial_success,
+        if total_addrs > 0 {
+            dial_success as f64 / total_addrs as f64 * 100.0
+        } else {
+            0.0
+        }
+    )?;
+    writeln!(
+        w,
+        "       \u{251c}\u{2500} Failed:     {:>6} ({:.1}%)",
+        dial_failed,
+        if total_addrs > 0 {
+            dial_failed as f64 / total_addrs as f64 * 100.0
+        } else {
+            0.0
+        }
+    )?;
+    writeln!(
+        w,
+        "       \u{2514}\u{2500} Pending:    {:>6}",
+        dial_pending
     )?;
     writeln!(w)?;
 
@@ -750,6 +843,15 @@ pub async fn check_authorities(
     )?;
 
     let mut check_results = run_connectivity_checks(pending_checks, dial_timeout, &mut w).await;
+
+    // Enrich each address check with the libp2p dial outcome.
+    for checks in check_results.values_mut() {
+        for check in checks.iter_mut() {
+            if let Some(ref addr) = check.full_address {
+                check.dial_outcome = dial_outcomes.get(addr).cloned();
+            }
+        }
+    }
     writeln!(w)?;
 
     // Build per-authority results.
