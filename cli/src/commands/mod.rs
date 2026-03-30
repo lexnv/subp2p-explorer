@@ -5,6 +5,7 @@
 pub mod authorities;
 pub mod authority_check;
 pub mod bootnodes;
+pub mod dial_peer;
 pub mod discovery;
 pub mod extrinsics;
 pub mod identity;

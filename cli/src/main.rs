@@ -10,6 +10,7 @@ use commands::{
     authorities::{discover_authorities, resolve_bootnodes},
     authority_check::check_authorities,
     bootnodes::verify_bootnodes,
+    dial_peer::dial_peer,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
 };
@@ -21,6 +22,7 @@ use std::{error::Error, io::Read, path::PathBuf};
 enum Command {
     Authorities(Authorities),
     AuthorityCheck(AuthorityCheckOpts),
+    DialPeer(DialPeerOpts),
     SendExtrinisic(SendExtrinisicOpts),
     DiscoverNetwork(DiscoverNetworkOpts),
     VerifyBootnodes(BootnodesOpts),
@@ -111,6 +113,20 @@ pub struct AuthorityCheckOpts {
     /// Write the full results as a JSON report to the given file path.
     #[clap(long)]
     json: Option<PathBuf>,
+}
+
+/// Dial one or more multiaddresses and fetch the identify message from each peer.
+#[derive(Debug, ClapParser)]
+pub struct DialPeerOpts {
+    /// Multiaddresses to dial.
+    ///
+    /// For example, "/ip4/35.75.15.11/tcp/30333" or
+    /// "/dns/example.com/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp".
+    #[clap(long, use_value_delimiter = true, value_parser)]
+    address: Vec<String>,
+    /// The number of seconds to wait for responses before giving up.
+    #[clap(long, short, default_value = "30", value_parser = parse_duration)]
+    timeout: std::time::Duration,
 }
 
 /// Send extrinsic on the p2p network.
@@ -252,6 +268,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await
         }
+        Command::DialPeer(opts) => dial_peer(opts.address, opts.timeout).await,
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
             let rpc_url = Url::parse(&opts.url)?;
