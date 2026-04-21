@@ -6,7 +6,7 @@ use crate::commands::authorities::{
     detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
     runtime_api_autorities, AuthorityDiscovery, DialOutcome,
 };
-use crate::commands::identity::fetch_identity_names;
+use crate::commands::identity::{fetch_identity_names, IdentityResult};
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
@@ -108,6 +108,8 @@ struct AddressCheck {
 #[derive(Serialize)]
 struct AuthorityResult {
     authority_ss58: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stash_ss58: Option<String>,
     identity_name: Option<String>,
     peer_id: Option<String>,
     agent_version: Option<String>,
@@ -304,6 +306,9 @@ fn print_authority_result(
     }
     writeln!(w)?;
 
+    if let Some(ref stash) = result.stash_ss58 {
+        writeln!(w, "  Stash:    {}", stash)?;
+    }
     if let Some(ref name) = result.identity_name {
         writeln!(w, "  Identity: {}", name)?;
     }
@@ -745,8 +750,10 @@ pub async fn check_authorities(
         .map_err(|e| format!("Invalid --identity-rpc URL: {}", e))?;
 
     writeln!(w, "[2/4] Resolving on-chain identities...")?;
-    let identity_names =
-        fetch_identity_names(rpc_url.clone(), identity_url, &authorities, &mut w).await;
+    let IdentityResult {
+        names: identity_names,
+        stash_accounts,
+    } = fetch_identity_names(rpc_url.clone(), identity_url, &authorities, &mut w).await;
     writeln!(w)?;
 
     writeln!(
@@ -859,12 +866,14 @@ pub async fn check_authorities(
 
     for (idx, authority) in authorities.iter().enumerate() {
         let authority_ss58 = to_ss58(authority, version);
+        let stash_ss58 = stash_accounts.get(authority).map(|s| to_ss58(s, version));
 
         let identity_name = identity_names.get(authority).cloned();
 
         let Some(addrs) = authority_to_details.get(authority) else {
             results.push(AuthorityResult {
                 authority_ss58,
+                stash_ss58,
                 identity_name,
                 peer_id: None,
                 agent_version: None,
@@ -882,6 +891,7 @@ pub async fn check_authorities(
 
         results.push(AuthorityResult {
             authority_ss58,
+            stash_ss58,
             identity_name,
             peer_id: peer_id.map(|p| p.to_string()),
             agent_version,

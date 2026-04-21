@@ -231,13 +231,23 @@ async fn batch_get_storage(
 /// 3. Falls back to `Identity::SuperOf` → parent `IdentityOf` for sub-identities.
 ///
 /// When `identity_url` is `None` the relay chain RPC is used for identity lookups.
+/// Result of identity resolution: display names and authority → stash account mapping.
+pub struct IdentityResult {
+    pub names: HashMap<sr25519::PublicKey, String>,
+    pub stash_accounts: HashMap<sr25519::PublicKey, [u8; 32]>,
+}
+
 pub async fn fetch_identity_names(
     relay_url: Url,
     identity_url: Option<Url>,
     authorities: &[sr25519::PublicKey],
     w: &mut impl Write,
-) -> HashMap<sr25519::PublicKey, String> {
+) -> IdentityResult {
     let mut names: HashMap<sr25519::PublicKey, String> = HashMap::new();
+    let empty_result = || IdentityResult {
+        names: HashMap::new(),
+        stash_accounts: HashMap::new(),
+    };
 
     writeln!(w, "       Resolving authority keys → stash accounts...").ok();
 
@@ -245,7 +255,7 @@ pub async fn fetch_identity_names(
         Ok(c) => c,
         Err(e) => {
             writeln!(w, "       Warning: relay RPC connection failed: {}", e).ok();
-            return names;
+            return empty_result();
         }
     };
 
@@ -259,7 +269,7 @@ pub async fn fetch_identity_names(
         Ok(v) => v,
         Err(e) => {
             writeln!(w, "       Warning: Session::KeyOwner query failed: {}", e).ok();
-            return names;
+            return empty_result();
         }
     };
 
@@ -283,7 +293,7 @@ pub async fn fetch_identity_names(
     .ok();
 
     if auth_to_stash.is_empty() {
-        return names;
+        return empty_result();
     }
 
     let id_url = identity_url.unwrap_or(relay_url);
@@ -298,7 +308,10 @@ pub async fn fetch_identity_names(
                 e
             )
             .ok();
-            return names;
+            return IdentityResult {
+                names,
+                stash_accounts: auth_to_stash,
+            };
         }
     };
 
@@ -320,7 +333,10 @@ pub async fn fetch_identity_names(
                 e
             )
             .ok();
-            return names;
+            return IdentityResult {
+                names,
+                stash_accounts: auth_to_stash,
+            };
         }
     };
 
@@ -387,7 +403,10 @@ pub async fn fetch_identity_names(
     )
     .ok();
 
-    names
+    IdentityResult {
+        names,
+        stash_accounts: auth_to_stash,
+    }
 }
 
 #[cfg(test)]
