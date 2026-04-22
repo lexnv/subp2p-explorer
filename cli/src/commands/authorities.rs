@@ -527,9 +527,15 @@ impl AuthorityDiscovery {
                                 if !self.dialed_addresses.contains(addr) {
                                     self.dialed_addresses.insert(addr.clone());
                                     if let Err(e) = self.swarm.dial(addr.clone()) {
+                                        let msg = format!("{e}");
+                                        let msg = if msg.is_empty() {
+                                            format!("{e:?}")
+                                        } else {
+                                            msg
+                                        };
                                         self.dial_outcomes.insert(
                                             addr.clone(),
-                                            DialOutcome::Failed(format!("{e}")),
+                                            DialOutcome::Failed(msg),
                                         );
                                     }
                                 }
@@ -682,10 +688,14 @@ impl AuthorityDiscovery {
                     DialError::Transport(attempts) => {
                         for (addr, transport_err) in attempts {
                             if self.dialed_addresses.contains(addr) {
-                                self.dial_outcomes.insert(
-                                    addr.clone(),
-                                    DialOutcome::Failed(format!("{transport_err}")),
-                                );
+                                let msg = format!("{transport_err}");
+                                let msg = if msg.is_empty() {
+                                    format!("transport: {transport_err:?}")
+                                } else {
+                                    format!("transport: {msg}")
+                                };
+                                self.dial_outcomes
+                                    .insert(addr.clone(), DialOutcome::Failed(msg));
                             }
                         }
                     }
