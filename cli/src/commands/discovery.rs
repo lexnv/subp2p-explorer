@@ -4,7 +4,7 @@
 
 use crate::utils::{build_swarm, is_public_address, Location, Locator};
 use codec::Decode;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use libp2p::{
     identify::Info,
     kad::{Event as KademliaEvent, GetClosestPeersError, GetClosestPeersOk, QueryId, QueryResult},
@@ -28,10 +28,15 @@ use trust_dns_resolver::{
     TokioAsyncResolver,
 };
 
+/// Maximum number of concurrent `get-closest-peers` random-walk queries
+/// kept in flight. Each completed query is immediately replaced so the DHT
+/// is walked at a constant, aggressive rate.
+const MAX_QUERIES: usize = 128;
+
 struct NetworkDiscovery {
     /// Drive the network behavior.
     swarm: Swarm<Behaviour>,
-    /// In flight kademlia queries.
+    /// In flight kademlia `get-closest-peers` queries.
     queries: HashSet<QueryId>,
     /// Discovered peers by kademlia queries.
     discovered_with_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
@@ -41,6 +46,9 @@ struct NetworkDiscovery {
     peer_role: HashMap<PeerId, ProtocolRole>,
     /// Peers dialed.
     dialed_peers: HashMap<PeerId, usize>,
+    /// Addresses for which a libp2p dial has been initiated, used to avoid
+    /// dialing the same address repeatedly.
+    dialed_addresses: HashSet<Multiaddr>,
 }
 
 impl NetworkDiscovery {
@@ -53,21 +61,37 @@ impl NetworkDiscovery {
             peer_details: HashMap::with_capacity(1024),
             peer_role: HashMap::with_capacity(1024),
             dialed_peers: HashMap::with_capacity(1024),
+            dialed_addresses: HashSet::with_capacity(4096),
         }
     }
 
-    /// Insert a number of queries to randomly walk the DHT.
-    ///
-    /// Performs a Kademlia query that returns a number of closest peers up to
-    /// the replication factor (k = 20 for substrate chains).
-    fn insert_queries(&mut self, num: usize) {
-        for _ in 0..num {
+    /// Top up the in-flight `get-closest-peers` queries so that exactly
+    /// [`MAX_QUERIES`] random walks are always running. Completed queries
+    /// are replaced immediately instead of waiting for the batch to drain.
+    fn top_up_queries(&mut self) {
+        while self.queries.len() < MAX_QUERIES {
             self.queries.insert(
                 self.swarm
                     .behaviour_mut()
                     .discovery
                     .get_closest_peers(PeerId::random()),
             );
+        }
+    }
+
+    /// Force-dial a freshly-discovered address through the full libp2p
+    /// stack to trigger noise + yamux + identify + notification handshakes.
+    /// Each address is dialed at most once.
+    fn force_dial(&mut self, peer: PeerId, addr: Multiaddr) {
+        if !self.dialed_addresses.insert(addr.clone()) {
+            return;
+        }
+        self.swarm
+            .behaviour_mut()
+            .discovery
+            .add_address(&peer, addr.clone());
+        if let Err(e) = self.swarm.dial(addr.clone()) {
+            log::trace!("Dial failed peer={peer} addr={addr}: {e:?}");
         }
     }
 
@@ -84,108 +108,131 @@ impl NetworkDiscovery {
 
     /// Drive the network behavior events.
     pub async fn drive_events(&mut self) {
-        // Start by performing 128 queries.
-        self.insert_queries(128);
+        // Prime the DHT with a full batch of random walks.
+        self.top_up_queries();
 
-        let mut old_log_time = std::time::Instant::now();
+        let mut resubmit_interval = tokio::time::interval(Duration::from_secs(15));
+        resubmit_interval.tick().await; // first tick returns immediately
+
+        let mut log_interval = tokio::time::interval(Duration::from_secs(10));
+        log_interval.tick().await;
 
         loop {
-            let event = self.swarm.select_next_some().await;
-
-            match event {
-                SwarmEvent::Dialing { peer_id, .. } => {
-                    self.dialed_peer(peer_id);
+            futures::select! {
+                event = self.swarm.select_next_some().fuse() => {
+                    self.handle_event(event);
                 }
 
-                SwarmEvent::Behaviour(BehaviourEvent::Discovery(event)) => match event {
-                    KademliaEvent::OutboundQueryProgressed {
-                        id,
-                        result: QueryResult::GetClosestPeers(result),
-                        ..
-                    } => {
-                        self.queries.remove(&id);
+                _ = resubmit_interval.tick().fuse() => {
+                    // Replace any silently-stalled queries so DHT pressure stays constant.
+                    self.top_up_queries();
+                }
 
-                        // It might be possible that the query did not finish in 5 minutes.
-                        // However we capture the provided peers.
-                        // Peers are later reported by kademila events handled below.
-                        let peers = match result {
-                            Ok(GetClosestPeersOk { peers, .. }) => peers,
-                            Err(GetClosestPeersError::Timeout { peers, .. }) => peers,
-                        };
-                        let num_discovered = peers.len();
-
-                        let now = std::time::Instant::now();
-                        if now.duration_since(old_log_time) > Duration::from_secs(10) {
-                            old_log_time = now;
-                            log::info!("...Discovery in progress last_query_num={num_discovered}");
-                        }
-
-                        if self.queries.is_empty() {
-                            self.insert_queries(128);
-                        }
-                    }
-
-                    KademliaEvent::RoutingUpdated {
-                        peer, addresses, ..
-                    } => {
-                        match self.discovered_with_addresses.entry(peer) {
-                            Entry::Occupied(mut occupied) => {
-                                occupied.get_mut().extend(addresses.into_vec());
-                            }
-                            Entry::Vacant(vacant) => {
-                                vacant.insert(addresses.iter().cloned().collect());
-                            }
-                        };
-                    }
-
-                    KademliaEvent::RoutablePeer { peer, address }
-                    | KademliaEvent::PendingRoutablePeer { peer, address } => {
-                        match self.discovered_with_addresses.entry(peer) {
-                            Entry::Occupied(mut occupied) => {
-                                occupied.get_mut().insert(address);
-                            }
-                            Entry::Vacant(vacant) => {
-                                let mut set = HashSet::new();
-                                set.insert(address);
-                                vacant.insert(set);
-                            }
-                        };
-                    }
-                    _ => (),
-                },
-
-                SwarmEvent::Behaviour(BehaviourEvent::PeerInfo(info_event)) => match info_event {
-                    PeerInfoEvent::Identified { peer_id, info } => {
-                        log::debug!("Identified peer_id={:?} info={:?}", peer_id, info);
-                        self.peer_details.insert(peer_id, info);
-                    }
-                },
-
-                SwarmEvent::Behaviour(BehaviourEvent::Notifications(
-                    NotificationsToSwarm::CustomProtocolOpen {
-                        peer_id,
-                        index,
-                        received_handshake,
-                        inbound,
-                        ..
-                    },
-                )) => {
-                    if let Ok(role) = ProtocolRole::decode(&mut &received_handshake[..]) {
-                        log::debug!("Identified peer_id={:?} role={:?}", peer_id, role);
-                        self.peer_role.insert(peer_id, role);
-                    }
-
-                    log::debug!(
-                        "Protocol open peer={:?} index={:?} handshake={:?} inbound={:?}",
-                        peer_id,
-                        index,
-                        received_handshake,
-                        inbound
+                _ = log_interval.tick().fuse() => {
+                    log::info!(
+                        "...Discovery in progress discovered={} identified={} roles={} dialed_addrs={} queries_in_flight={}",
+                        self.discovered_with_addresses.len(),
+                        self.peer_details.len(),
+                        self.peer_role.len(),
+                        self.dialed_addresses.len(),
+                        self.queries.len(),
                     );
                 }
-
-                _ => (),
             }
+        }
+    }
+
+    fn handle_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        match event {
+            SwarmEvent::Dialing { peer_id, .. } => {
+                self.dialed_peer(peer_id);
+            }
+
+            SwarmEvent::Behaviour(BehaviourEvent::Discovery(event)) => match event {
+                KademliaEvent::OutboundQueryProgressed {
+                    id,
+                    result: QueryResult::GetClosestPeers(result),
+                    ..
+                } => {
+                    self.queries.remove(&id);
+
+                    // The result may time out; the peers already visited are still
+                    // surfaced as RoutingUpdated / RoutablePeer events below.
+                    let _peers = match result {
+                        Ok(GetClosestPeersOk { peers, .. }) => peers,
+                        Err(GetClosestPeersError::Timeout { peers, .. }) => peers,
+                    };
+
+                    // Top up immediately on every completion so concurrency never
+                    // drops, instead of waiting for the whole batch to drain.
+                    self.top_up_queries();
+                }
+
+                KademliaEvent::RoutingUpdated {
+                    peer, addresses, ..
+                } => {
+                    let addrs = addresses.into_vec();
+                    for addr in &addrs {
+                        self.force_dial(peer, addr.clone());
+                    }
+                    match self.discovered_with_addresses.entry(peer) {
+                        Entry::Occupied(mut occupied) => {
+                            occupied.get_mut().extend(addrs);
+                        }
+                        Entry::Vacant(vacant) => {
+                            vacant.insert(addrs.into_iter().collect());
+                        }
+                    };
+                }
+
+                KademliaEvent::RoutablePeer { peer, address }
+                | KademliaEvent::PendingRoutablePeer { peer, address } => {
+                    self.force_dial(peer, address.clone());
+                    match self.discovered_with_addresses.entry(peer) {
+                        Entry::Occupied(mut occupied) => {
+                            occupied.get_mut().insert(address);
+                        }
+                        Entry::Vacant(vacant) => {
+                            let mut set = HashSet::new();
+                            set.insert(address);
+                            vacant.insert(set);
+                        }
+                    };
+                }
+                _ => (),
+            },
+
+            SwarmEvent::Behaviour(BehaviourEvent::PeerInfo(info_event)) => match info_event {
+                PeerInfoEvent::Identified { peer_id, info } => {
+                    log::debug!("Identified peer_id={:?} info={:?}", peer_id, info);
+                    self.peer_details.insert(peer_id, info);
+                }
+            },
+
+            SwarmEvent::Behaviour(BehaviourEvent::Notifications(
+                NotificationsToSwarm::CustomProtocolOpen {
+                    peer_id,
+                    index,
+                    received_handshake,
+                    inbound,
+                    ..
+                },
+            )) => {
+                if let Ok(role) = ProtocolRole::decode(&mut &received_handshake[..]) {
+                    log::debug!("Identified peer_id={:?} role={:?}", peer_id, role);
+                    self.peer_role.insert(peer_id, role);
+                }
+
+                log::debug!(
+                    "Protocol open peer={:?} index={:?} handshake={:?} inbound={:?}",
+                    peer_id,
+                    index,
+                    received_handshake,
+                    inbound
+                );
+            }
+
+            _ => (),
         }
     }
 }
@@ -196,6 +243,7 @@ pub async fn discover_network(
     num_cities: Option<usize>,
     raw_geolocation: bool,
     only_authorities: bool,
+    identified: bool,
     timeout: std::time::Duration,
     query_timeout: std::time::Duration,
 ) -> Result<(), Box<dyn Error>> {
@@ -264,6 +312,21 @@ pub async fn discover_network(
                     .peer_details
                     .get(peer)
                     .map(|info| info.agent_version.clone())
+            );
+        }
+    }
+
+    if identified {
+        println!();
+        println!(
+            "Identified peers (responded to identify) num={}",
+            network_discovery.peer_details.len()
+        );
+        for (peer, info) in &network_discovery.peer_details {
+            let role = network_discovery.peer_role.get(peer);
+            println!(
+                "identified={peer} version={:?} role={:?}",
+                info.agent_version, role
             );
         }
     }

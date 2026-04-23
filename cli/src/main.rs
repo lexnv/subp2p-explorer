@@ -169,6 +169,10 @@ pub struct DiscoverNetworkOpts {
     /// Show only authorities.
     #[clap(long, short)]
     only_authorities: bool,
+    /// Print every peer that responded to the identify protocol, along with
+    /// its agent version and announced role (if any).
+    #[clap(long)]
+    identified: bool,
     /// The number of seconds the discovery process should run for.
     #[clap(long, short, value_parser = parse_duration)]
     timeout: std::time::Duration,
@@ -263,6 +267,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.cities,
                 opts.raw_geolocation,
                 opts.only_authorities,
+                opts.identified,
                 opts.timeout,
                 opts.query_timeout,
             )
