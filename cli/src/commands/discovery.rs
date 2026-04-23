@@ -2,9 +2,11 @@
 // This file is dual-licensed as Apache-2.0 or GPL-3.0.
 // see LICENSE for license details.
 
+use crate::commands::authorities::{fetch_genesis_hash, resolve_bootnodes};
 use crate::utils::{build_swarm, is_public_address, Location, Locator};
 use codec::Decode;
 use futures::{FutureExt, StreamExt};
+use jsonrpsee::client_transport::ws::Url;
 use libp2p::{
     identify::Info,
     kad::{Event as KademliaEvent, GetClosestPeersError, GetClosestPeersOk, QueryId, QueryResult},
@@ -238,7 +240,8 @@ impl NetworkDiscovery {
 }
 
 pub async fn discover_network(
-    genesis: String,
+    url: String,
+    genesis: Option<String>,
     bootnodes: Vec<String>,
     num_cities: Option<usize>,
     raw_geolocation: bool,
@@ -247,6 +250,20 @@ pub async fn discover_network(
     timeout: std::time::Duration,
     query_timeout: std::time::Duration,
 ) -> Result<(), Box<dyn Error>> {
+    let rpc_url = Url::parse(&url)?;
+
+    let genesis = match genesis {
+        Some(g) => g,
+        None => {
+            println!("       No genesis hash provided, fetching from RPC...");
+            let hash = fetch_genesis_hash(rpc_url.clone()).await?;
+            println!("       Genesis hash: 0x{}", hash);
+            hash
+        }
+    };
+
+    let bootnodes = resolve_bootnodes(&rpc_url, bootnodes, &mut std::io::stdout()).await?;
+
     let swarm = build_swarm(genesis.clone(), bootnodes, query_timeout).await?;
     let mut network_discovery = NetworkDiscovery::new(swarm);
 

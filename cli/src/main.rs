@@ -149,13 +149,17 @@ pub struct SendExtrinisicOpts {
 /// Discover the p2p network.
 #[derive(Debug, ClapParser)]
 pub struct DiscoverNetworkOpts {
+    /// The URL of the chain RPC endpoint.
+    #[clap(long, short)]
+    url: String,
     /// Hex-encoded genesis hash of the chain.
     ///
-    /// For example, "781e4046b4e8b5e83d33dde04b32e7cb5d43344b1f19b574f6d31cbbd99fe738"
+    /// If not provided, the genesis hash is fetched from the RPC endpoint.
     #[clap(long, short)]
-    genesis: String,
+    genesis: Option<String>,
     /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
-    /// For example, "/ip4/127.0.0.1/tcp/30333/ws/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp".
+    ///
+    /// If not provided, bootnodes are fetched from the chain spec via the RPC endpoint.
     #[clap(long, use_value_delimiter = true, value_parser)]
     bootnodes: Vec<String>,
     /// The number of cities to print in decreasing order by the number of peers.
@@ -262,6 +266,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::DiscoverNetwork(opts) => {
             discover_network(
+                opts.url,
                 opts.genesis,
                 opts.bootnodes,
                 opts.cities,
