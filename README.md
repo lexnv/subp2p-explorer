@@ -102,3 +102,24 @@ To verify that the extrinsic was included in the chain, use [subxt](https://gith
 ```bash
 $ cargo run -- send-extrinisic --genesis 781e4046b4e8b5e83d33dde04b32e7cb5d43344b1f19b574f6d31cbbd99fe738 --bootnodes /ip4/127.0.0.1/tcp/30333/ws/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp --extrinsics 04310...c0
 ```
+
+
+## Commands
+
+### discover-network
+
+* Polkadot
+
+```bash
+RUST_LOG=info cargo run --release -p subp2p-explorer-cli -- discover-network \
+  --url wss://rpc.polkadot.io \
+  --timeout 900 --identified
+```
+
+* Polkadot Asset Hub
+
+```bash
+RUST_LOG=info cargo run --release -p subp2p-explorer-cli -- discover-network \
+  --url wss://rpc.polkadot.io \
+  --timeout 900 --identified
+```
