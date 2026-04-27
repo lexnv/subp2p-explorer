@@ -11,6 +11,7 @@ use commands::{
     authority_check::check_authorities,
     bootnodes::verify_bootnodes,
     dial_peer::dial_peer,
+    discover_peer::discover_peer,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
 };
@@ -25,6 +26,7 @@ enum Command {
     DialPeer(DialPeerOpts),
     SendExtrinisic(SendExtrinisicOpts),
     DiscoverNetwork(DiscoverNetworkOpts),
+    DiscoverPeer(DiscoverPeerOpts),
     VerifyBootnodes(BootnodesOpts),
 }
 
@@ -187,6 +189,43 @@ pub struct DiscoverNetworkOpts {
     query_timeout: std::time::Duration,
 }
 
+/// Discover a single peer on the p2p network.
+///
+/// Performs aggressive Kademlia `get-closest-peers` queries keyed exclusively
+/// on the target peer ID, force-dialing every peer surfaced along the way
+/// until the target is identified or the timeout fires.
+#[derive(Debug, ClapParser)]
+pub struct DiscoverPeerOpts {
+    /// The URL of the chain RPC endpoint.
+    #[clap(long, short)]
+    url: String,
+    /// The target peer ID to hunt (e.g. "12D3KooW...").
+    #[clap(long)]
+    peer: String,
+    /// Hex-encoded genesis hash of the chain.
+    ///
+    /// If not provided, the genesis hash is fetched from the RPC endpoint.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Bootnodes of the chain, must contain a multiaddress together with the peer ID.
+    ///
+    /// If not provided, bootnodes are fetched from the chain spec via the RPC endpoint.
+    #[clap(long, use_value_delimiter = true, value_parser)]
+    bootnodes: Vec<String>,
+    /// Print every peer that responded to the identify protocol, along with
+    /// its agent version and announced role (if any).
+    #[clap(long)]
+    identified: bool,
+    /// The number of seconds the discovery process should run for.
+    #[clap(long, short, value_parser = parse_duration)]
+    timeout: std::time::Duration,
+    /// The number of seconds for each individual Kademlia DHT query before it is
+    /// considered failed. Lower values free up query slots faster when records
+    /// do not exist in the DHT.
+    #[clap(long, default_value = "15", value_parser = parse_duration)]
+    query_timeout: std::time::Duration,
+}
+
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
     let seconds = arg.parse()?;
     Ok(std::time::Duration::from_secs(seconds))
@@ -272,6 +311,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.cities,
                 opts.raw_geolocation,
                 opts.only_authorities,
+                opts.identified,
+                opts.timeout,
+                opts.query_timeout,
+            )
+            .await
+        }
+        Command::DiscoverPeer(opts) => {
+            discover_peer(
+                opts.url,
+                opts.peer,
+                opts.genesis,
+                opts.bootnodes,
                 opts.identified,
                 opts.timeout,
                 opts.query_timeout,
