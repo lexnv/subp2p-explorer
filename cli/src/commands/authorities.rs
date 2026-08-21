@@ -1,4 +1,4 @@
-use crate::utils::build_swarm;
+use crate::utils::{build_swarm, is_public_address};
 use codec::Decode;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -11,13 +11,14 @@ use libp2p::{
     core::ConnectedPoint,
     identify::Info,
     kad::{Event as KademliaEvent, GetRecordOk, QueryId, QueryResult, RecordKey as KademliaKey},
-    swarm::{DialError, SwarmEvent},
+    multiaddr::Protocol,
+    swarm::{dial_opts::DialOpts, ConnectionId, DialError, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use rand::{seq::SliceRandom, thread_rng};
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use subp2p_explorer::{
     peer_behavior::PeerInfoEvent,
@@ -278,10 +279,17 @@ pub struct AuthorityDiscovery {
     /// Timeout duration for display purposes.
     timeout_secs: u64,
 
-    /// Per-address libp2p dial outcomes (noise + yamux + identify negotiation).
+    /// Per-address libp2p dial outcomes (noise + yamux upgrade).
     dial_outcomes: HashMap<Multiaddr, DialOutcome>,
-    /// Addresses for which a libp2p dial has been initiated.
+    /// Addresses already queued for dialing. Deduplicates addresses advertised
+    /// by more than one authority record.
     dialed_addresses: HashSet<Multiaddr>,
+    /// Addresses waiting to be dialed, per peer.
+    queued_dials: HashMap<PeerId, VecDeque<Multiaddr>>,
+    /// Dials we initiated ourselves, keyed by connection id. Dials started by
+    /// Kademlia during the crawl are not tracked here: they carry no
+    /// information about a specific advertised address.
+    active_dials: HashMap<ConnectionId, ActiveDial>,
 }
 
 /// The peer details extracted from the DHT.
@@ -306,8 +314,8 @@ impl PeerDetails {
     }
 }
 
-/// Outcome of dialing a single address through the full libp2p stack
-/// (noise handshake, yamux multiplexing, identify negotiation).
+/// Outcome of dialing a single address through the libp2p stack
+/// (noise handshake and yamux multiplexing).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", content = "reason")]
 pub enum DialOutcome {
@@ -315,6 +323,76 @@ pub enum DialOutcome {
     Success,
     /// Dial failed with an error.
     Failed(String),
+    /// The address was never dialed: it is not routable from here, its
+    /// transport is not supported, or the peer was already connected through
+    /// another address.
+    Skipped(String),
+}
+
+/// A dial we initiated to probe one specific advertised address.
+#[derive(Debug)]
+struct ActiveDial {
+    /// Peer the address belongs to.
+    peer: PeerId,
+    /// Address being probed.
+    address: Multiaddr,
+    /// Set when the peer became connected through another route while this
+    /// dial was in flight. Substrate nodes keep a single connection per peer
+    /// and close the redundant one, so the resulting error says nothing about
+    /// the address itself.
+    superseded: bool,
+}
+
+/// Shortest useful description of an error.
+///
+/// libp2p nests the interesting part deep inside wrapper types, several of
+/// which have an empty `Display`, so walk the chain and keep the innermost
+/// cause that actually says something.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = String::new();
+    let mut innermost = error;
+    let mut current = Some(error);
+
+    while let Some(err) = current {
+        let display = err.to_string();
+        if !display.is_empty() {
+            message = display;
+        }
+        innermost = err;
+        current = err.source();
+    }
+
+    if message.is_empty() {
+        format!("{innermost:?}")
+    } else {
+        message
+    }
+}
+
+/// Reason for a failed dial, as a single line.
+fn dial_error_message(error: &DialError) -> String {
+    match error {
+        DialError::Transport(attempts) => match attempts.first() {
+            Some((_, err)) => format!("transport: {}", root_cause(err)),
+            None => "transport: no attempt".to_string(),
+        },
+        DialError::WrongPeerId { obtained, .. } => format!("wrong peer ID: {obtained}"),
+        DialError::LocalPeerId { .. } => "dialed local peer ID".to_string(),
+        DialError::Denied { cause } => format!("denied: {}", root_cause(cause)),
+        DialError::DialPeerConditionFalse(condition) => {
+            format!("dial condition not met: {condition:?}")
+        }
+        DialError::Aborted => "aborted".to_string(),
+        DialError::NoAddresses => "no addresses".to_string(),
+    }
+}
+
+/// Whether the swarm can dial this address at all.
+///
+/// The swarm is built with TCP, DNS and WebSocket transports, all of which
+/// carry a `/tcp/` component.
+fn is_dialable_transport(addr: &Multiaddr) -> bool {
+    addr.iter().any(|proto| matches!(proto, Protocol::Tcp(_)))
 }
 
 impl AuthorityDiscovery {
@@ -352,6 +430,8 @@ impl AuthorityDiscovery {
 
             dial_outcomes: HashMap::with_capacity(4096),
             dialed_addresses: HashSet::with_capacity(4096),
+            queued_dials: HashMap::with_capacity(1024),
+            active_dials: HashMap::with_capacity(1024),
         }
     }
 
@@ -459,6 +539,125 @@ impl AuthorityDiscovery {
         }
     }
 
+    /// Record the outcome of dialing `addr`, keeping the strongest evidence
+    /// gathered for it.
+    ///
+    /// A success is never downgraded: Kademlia keeps dialing peers throughout
+    /// the crawl and a later failure (a redundant connection the remote closes,
+    /// or a dial after the peer went away) does not make a working address
+    /// unreachable. A skip is only recorded when nothing else is known.
+    fn record_dial_outcome(&mut self, addr: Multiaddr, outcome: DialOutcome) {
+        match self.dial_outcomes.get(&addr) {
+            Some(DialOutcome::Success) => (),
+            Some(_) if matches!(outcome, DialOutcome::Skipped(_)) => (),
+            _ => {
+                self.dial_outcomes.insert(addr, outcome);
+            }
+        }
+    }
+
+    /// Queue the addresses advertised by `peer_id` for dialing and start the
+    /// first probe.
+    ///
+    /// Addresses that cannot be reached from here are not dialed at all, so
+    /// that they do not pollute the reachability numbers.
+    fn queue_dials(&mut self, peer_id: PeerId, addresses: &[Multiaddr]) {
+        for addr in addresses {
+            if !self.dialed_addresses.insert(addr.clone()) {
+                continue;
+            }
+
+            if !is_public_address(addr) {
+                self.record_dial_outcome(addr.clone(), DialOutcome::Skipped("private".into()));
+                continue;
+            }
+            if !is_dialable_transport(addr) {
+                self.record_dial_outcome(
+                    addr.clone(),
+                    DialOutcome::Skipped("unsupported transport".into()),
+                );
+                continue;
+            }
+
+            self.queued_dials
+                .entry(peer_id)
+                .or_default()
+                .push_back(addr.clone());
+        }
+
+        self.advance_peer_dial(peer_id);
+    }
+
+    /// Probe the next queued address of `peer_id`.
+    ///
+    /// At most one dial per peer is in flight: substrate nodes keep a single
+    /// connection per peer and close any redundant one, which would otherwise
+    /// be reported as an unreachable address. While the peer is connected its
+    /// remaining addresses stay queued and are retried by
+    /// [`Self::drain_queued_dials`] once the connection is gone.
+    fn advance_peer_dial(&mut self, peer_id: PeerId) {
+        if self.active_dials.values().any(|dial| dial.peer == peer_id) {
+            return;
+        }
+        if self.swarm.is_connected(&peer_id) {
+            return;
+        }
+
+        while let Some(addr) = self
+            .queued_dials
+            .get_mut(&peer_id)
+            .and_then(|queue| queue.pop_front())
+        {
+            let opts = DialOpts::unknown_peer_id().address(addr.clone()).build();
+            let connection_id = opts.connection_id();
+
+            match self.swarm.dial(opts) {
+                Ok(()) => {
+                    self.active_dials.insert(
+                        connection_id,
+                        ActiveDial {
+                            peer: peer_id,
+                            address: addr,
+                            superseded: false,
+                        },
+                    );
+                    return;
+                }
+                Err(e) => {
+                    self.record_dial_outcome(addr, DialOutcome::Failed(dial_error_message(&e)))
+                }
+            }
+        }
+
+        self.queued_dials.remove(&peer_id);
+    }
+
+    /// Retry the addresses that stayed queued because their peer was connected
+    /// or already had a dial in flight.
+    fn drain_queued_dials(&mut self) {
+        let peers: Vec<PeerId> = self.queued_dials.keys().copied().collect();
+        for peer in peers {
+            self.advance_peer_dial(peer);
+        }
+    }
+
+    /// Account for the addresses that were never probed once the discovery is
+    /// over, so that they are not mistaken for unreachable ones.
+    fn finalize_queued_dials(&mut self) {
+        let queued: Vec<(PeerId, VecDeque<Multiaddr>)> = self.queued_dials.drain().collect();
+        for (peer, addresses) in queued {
+            let reason = if self.swarm.is_connected(&peer) {
+                "peer already connected"
+            } else {
+                "discovery ended before probing"
+            };
+
+            for addr in addresses {
+                self.record_dial_outcome(addr, DialOutcome::Skipped(reason.into()));
+            }
+        }
+    }
+
     /// Handle a swarm event from the p2p network.
     fn handle_swarm(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
@@ -520,26 +719,10 @@ impl AuthorityDiscovery {
                                     .add_address(&peer_id, addr.clone());
                             }
 
-                            // Dial each address individually through the full libp2p
-                            // stack (noise handshake, yamux, identify) to test
-                            // reachability per address.
-                            for addr in &addresses {
-                                if !self.dialed_addresses.contains(addr) {
-                                    self.dialed_addresses.insert(addr.clone());
-                                    if let Err(e) = self.swarm.dial(addr.clone()) {
-                                        let msg = format!("{e}");
-                                        let msg = if msg.is_empty() {
-                                            format!("{e:?}")
-                                        } else {
-                                            msg
-                                        };
-                                        self.dial_outcomes.insert(
-                                            addr.clone(),
-                                            DialOutcome::Failed(msg),
-                                        );
-                                    }
-                                }
-                            }
+                            // Probe the advertised addresses through the libp2p
+                            // stack (noise handshake, yamux) to test reachability
+                            // per address.
+                            self.queue_dials(peer_id, &addresses);
 
                             log::debug!(
                                 "{}/{} (err {}) authority: {:?} peer_id {:?} Addresses: {:?}",
@@ -650,11 +833,24 @@ impl AuthorityDiscovery {
                 num_established,
                 ..
             } => {
-                // Record successful dial outcome for addresses we initiated.
+                // The address that carried the connection is reachable, no
+                // matter who started the dial: Kademlia opens connections of
+                // its own during the crawl and they prove the same thing.
                 if let ConnectedPoint::Dialer { ref address, .. } = endpoint {
-                    if self.dialed_addresses.contains(address) {
-                        self.dial_outcomes
-                            .insert(address.clone(), DialOutcome::Success);
+                    self.record_dial_outcome(address.clone(), DialOutcome::Success);
+                }
+
+                if let Some(dial) = self.active_dials.remove(&connection_id) {
+                    self.record_dial_outcome(dial.address, DialOutcome::Success);
+                }
+
+                // Any other dial to this peer that is still in flight can only
+                // fail now, since the remote closes redundant connections. The
+                // addresses that are still queued keep waiting for the
+                // connection to go away.
+                for dial in self.active_dials.values_mut() {
+                    if dial.peer == peer_id {
+                        dial.superseded = true;
                     }
                 }
 
@@ -683,44 +879,17 @@ impl AuthorityDiscovery {
                 peer_id,
                 error,
             } => {
-                // Record failed dial outcomes for addresses we initiated.
-                match &error {
-                    DialError::Transport(attempts) => {
-                        for (addr, transport_err) in attempts {
-                            if self.dialed_addresses.contains(addr) {
-                                let msg = format!("{transport_err}");
-                                let msg = if msg.is_empty() {
-                                    format!("transport: {transport_err:?}")
-                                } else {
-                                    format!("transport: {msg}")
-                                };
-                                self.dial_outcomes
-                                    .insert(addr.clone(), DialOutcome::Failed(msg));
-                            }
-                        }
-                    }
-                    DialError::WrongPeerId {
-                        obtained, address, ..
-                    } => {
-                        if self.dialed_addresses.contains(address) {
-                            self.dial_outcomes.insert(
-                                address.clone(),
-                                DialOutcome::Failed(format!("wrong peer ID: {obtained}")),
-                            );
-                        }
-                    }
-                    DialError::LocalPeerId { address } => {
-                        if self.dialed_addresses.contains(address) {
-                            self.dial_outcomes.insert(
-                                address.clone(),
-                                DialOutcome::Failed("dialed local peer ID".into()),
-                            );
-                        }
-                    }
-                    DialError::Denied { cause } => {
-                        log::trace!("Dial denied: {:?}", cause);
-                    }
-                    _ => {}
+                // Only our own dials say something about a specific address.
+                // Kademlia dials the same peers over and over during the crawl
+                // and its failures must not overwrite what we learned.
+                if let Some(dial) = self.active_dials.remove(&connection_id) {
+                    let outcome = if dial.superseded {
+                        DialOutcome::Skipped("peer already connected".into())
+                    } else {
+                        DialOutcome::Failed(dial_error_message(&error))
+                    };
+                    self.record_dial_outcome(dial.address, outcome);
+                    self.advance_peer_dial(dial.peer);
                 }
 
                 log::trace!(
@@ -782,16 +951,18 @@ impl AuthorityDiscovery {
 
         let connected_peers = self.swarm.connected_peers().count();
         let queries_inflight = self.queries.len();
-        let dial_ok = self
-            .dial_outcomes
-            .values()
-            .filter(|o| matches!(o, DialOutcome::Success))
-            .count();
-        let dial_fail = self
-            .dial_outcomes
-            .values()
-            .filter(|o| matches!(o, DialOutcome::Failed(_)))
-            .count();
+        // Restricted to the advertised addresses: the outcome map also holds
+        // the connections Kademlia opened to the rest of the network.
+        let (dial_ok, dial_fail) = self
+            .dialed_addresses
+            .iter()
+            .fold((0, 0), |(ok, fail), addr| {
+                match self.dial_outcomes.get(addr) {
+                    Some(DialOutcome::Success) => (ok + 1, fail),
+                    Some(DialOutcome::Failed(_)) => (ok, fail + 1),
+                    _ => (ok, fail),
+                }
+            });
 
         print!(
             "\r       [{}] {}/{} ({:.1}%) | Id: {} | Dials: {}/{} ok | Err: {} | Peers: {} | Q: {} | {}s/{}s   ",
@@ -831,6 +1002,7 @@ impl AuthorityDiscovery {
 
                 _ = self.interval_resubmit.tick().fuse() => {
                     self.resubmit_remaining_dht_queries();
+                    self.drain_queued_dials();
                 }
 
                 _ = progress_interval.tick().fuse() => {
@@ -883,13 +1055,19 @@ impl AuthorityDiscovery {
     /// file descriptors so that subsequent phases (e.g. TCP reachability
     /// checks) do not hit the open-file limit.
     pub fn into_results(
-        self,
+        mut self,
     ) -> (
         HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
         HashMap<PeerId, Info>,
         HashMap<Multiaddr, DialOutcome>,
     ) {
-        (self.authority_to_details, self.peer_info, self.dial_outcomes)
+        self.finalize_queued_dials();
+
+        (
+            self.authority_to_details,
+            self.peer_info,
+            self.dial_outcomes,
+        )
     }
 }
 
