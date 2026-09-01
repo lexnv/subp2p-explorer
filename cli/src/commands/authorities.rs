@@ -233,6 +233,16 @@ pub(crate) async fn runtime_api_autorities(
 /// The maximum number of Kademlia `get-records` queried a time.
 const MAX_QUERIES: usize = 128;
 
+/// Exit the discovery early once every authority record was found, all dials
+/// resolved and the swarm has been quiet for this long.
+const COMPLETE_QUIET_SECS: u64 = 5;
+
+/// Exit the discovery early when some records were never found but nothing
+/// made progress for this long. Two resubmission rounds
+/// ([`AuthorityDiscovery::interval_resubmit`]) fit in this window, so a record
+/// that can still be found gets its chance before the crawl gives up.
+const STALL_QUIET_SECS: u64 = 30;
+
 /// Discover the authorities on the network.
 pub struct AuthorityDiscovery {
     /// Drive the network behavior.
@@ -266,6 +276,10 @@ pub struct AuthorityDiscovery {
 
     /// Time of the last log line.
     old_log: std::time::Instant,
+    /// Time of the last discovery progress: a new authority record, a resolved
+    /// probe dial, or an identify response from a validator. Used to exit
+    /// early once the crawl goes quiet instead of waiting for the timeout.
+    last_progress: std::time::Instant,
     /// Interval at which to resubmit the remaining queries.
     interval_resubmit: tokio::time::Interval,
     /// Interval at which to bail out.
@@ -368,6 +382,7 @@ impl AuthorityDiscovery {
             finished_query: false,
 
             old_log: std::time::Instant::now(),
+            last_progress: std::time::Instant::now(),
             interval_resubmit: tokio::time::interval(std::time::Duration::from_secs(15)),
             interval_exit: tokio::time::interval(timeout),
 
@@ -465,7 +480,14 @@ impl AuthorityDiscovery {
     /// this method will also submit the `get-closest-peers` queries to force the discovery
     /// of the peers that are not reachable at the moment.
     fn resubmit_remaining_dht_queries(&mut self) {
-        // Ignore older queries.
+        // Ignore older queries and finish them in Kademlia, otherwise they
+        // keep running in the background and compete with the new ones.
+        let stale: Vec<QueryId> = self.queries.keys().copied().collect();
+        for id in stale {
+            if let Some(mut query) = self.swarm.behaviour_mut().discovery.query_mut(&id) {
+                query.finish();
+            }
+        }
         self.queries.clear();
 
         let authorities = self.remaining_authorities.clone();
@@ -486,6 +508,48 @@ impl AuthorityDiscovery {
         }
     }
 
+    /// Mark that the discovery made progress towards its goal (a new record,
+    /// a resolved probe dial, or a validator identify response).
+    ///
+    /// Kademlia background churn (random-walk queries, connections to
+    /// non-validator peers) intentionally does not count as progress,
+    /// otherwise the crawl would never be considered quiet.
+    fn touch_progress(&mut self) {
+        self.last_progress = std::time::Instant::now();
+    }
+
+    /// Whether the discovery has nothing left to do and can exit before the
+    /// timeout.
+    ///
+    /// Once every probe dial is resolved and nothing made progress for a
+    /// quiet period, waiting for the timeout only burns time. The quiet
+    /// period is short when every authority record was found, and longer when
+    /// records are still missing so that the periodic resubmission gets a
+    /// chance to find them.
+    fn discovery_finished(&self) -> bool {
+        if !self.active_dials.is_empty() {
+            return false;
+        }
+
+        // Addresses queued behind a live connection are never probed while
+        // the connection lasts; they are finalized as skipped. A queue for a
+        // disconnected peer still has probes to run.
+        if !self
+            .queued_dials
+            .keys()
+            .all(|peer| self.swarm.is_connected(peer))
+        {
+            return false;
+        }
+
+        let quiet_secs = if self.remaining_authorities.is_empty() {
+            COMPLETE_QUIET_SECS
+        } else {
+            STALL_QUIET_SECS
+        };
+        self.last_progress.elapsed() >= std::time::Duration::from_secs(quiet_secs)
+    }
+
     /// Record the outcome of dialing `addr`, keeping the strongest evidence
     /// gathered for it.
     ///
@@ -503,8 +567,8 @@ impl AuthorityDiscovery {
         }
     }
 
-    /// Queue the addresses advertised by `peer_id` for dialing and start the
-    /// first probe.
+    /// Queue the addresses advertised by `peer_id` for dialing and start
+    /// probing them.
     ///
     /// Addresses that cannot be reached from here are not dialed at all, so
     /// that they do not pollute the reachability numbers.
@@ -535,26 +599,26 @@ impl AuthorityDiscovery {
         self.advance_peer_dial(peer_id);
     }
 
-    /// Probe the next queued address of `peer_id`.
+    /// Probe all queued addresses of `peer_id` concurrently.
     ///
-    /// At most one dial per peer is in flight: substrate nodes keep a single
-    /// connection per peer and close any redundant one, which would otherwise
-    /// be reported as an unreachable address. While the peer is connected its
-    /// remaining addresses stay queued and are retried by
-    /// [`Self::drain_queued_dials`] once the connection is gone.
+    /// Substrate nodes keep a single connection per peer and close any
+    /// redundant one, so the first dial that succeeds marks the remaining
+    /// in-flight dials as superseded and their failures are recorded as skips
+    /// rather than unreachable addresses. Dialing concurrently means a dead
+    /// address no longer delays the working ones by a full connection
+    /// timeout, which matters most for getting the identify response quickly.
+    /// While the peer is connected its remaining addresses stay queued and are
+    /// retried by [`Self::drain_queued_dials`] once the connection is gone.
     fn advance_peer_dial(&mut self, peer_id: PeerId) {
-        if self.active_dials.values().any(|dial| dial.peer == peer_id) {
-            return;
-        }
         if self.swarm.is_connected(&peer_id) {
             return;
         }
 
-        while let Some(addr) = self
-            .queued_dials
-            .get_mut(&peer_id)
-            .and_then(|queue| queue.pop_front())
-        {
+        let Some(mut queue) = self.queued_dials.remove(&peer_id) else {
+            return;
+        };
+
+        while let Some(addr) = queue.pop_front() {
             let opts = DialOpts::unknown_peer_id().address(addr.clone()).build();
             let connection_id = opts.connection_id();
 
@@ -568,15 +632,12 @@ impl AuthorityDiscovery {
                             superseded: false,
                         },
                     );
-                    return;
                 }
                 Err(e) => {
                     self.record_dial_outcome(addr, DialOutcome::Failed(dial_error_message(&e)))
                 }
             }
         }
-
-        self.queued_dials.remove(&peer_id);
     }
 
     /// Retry the addresses that stayed queued because their peer was connected
@@ -620,6 +681,17 @@ impl AuthorityDiscovery {
                     }) => {
                         // Has received at least one answer for this and can advance the queries.
                         self.queries.remove(&id);
+
+                        // The first record is enough: finish the underlying
+                        // Kademlia query so it stops crawling in the
+                        // background. Without this, replacement queries are
+                        // submitted while the old ones still run, and the
+                        // number of in-flight lookups balloons far beyond
+                        // `MAX_QUERIES`, slowing every query down.
+                        if let Some(mut query) = self.swarm.behaviour_mut().discovery.query_mut(&id)
+                        {
+                            query.finish();
+                        }
 
                         if let Ok(GetRecordOk::FoundRecord(peer_record)) = record {
                             let key = peer_record.record.key;
@@ -702,7 +774,9 @@ impl AuthorityDiscovery {
                                 );
                             }
 
-                            self.remaining_authorities.remove(&authority);
+                            if self.remaining_authorities.remove(&authority) {
+                                self.touch_progress();
+                            }
                         } else {
                             log::debug!(
                                 "DHT query failed: {:?} (in-flight: {}, remaining: {})",
@@ -749,6 +823,16 @@ impl AuthorityDiscovery {
                                     );
                                 }
 
+                                // A validator identify response is the goal of
+                                // the whole crawl, so it counts as progress.
+                                // Identifies of random network peers do not:
+                                // they arrive for as long as Kademlia crawls.
+                                if self.peer_details.contains_key(&peer_id)
+                                    && !self.peer_info.contains_key(&peer_id)
+                                {
+                                    self.touch_progress();
+                                }
+
                                 // Save the record.
                                 self.peer_info.insert(peer_id, info);
                             }
@@ -789,6 +873,17 @@ impl AuthorityDiscovery {
 
                 if let Some(dial) = self.active_dials.remove(&connection_id) {
                     self.record_dial_outcome(dial.address, DialOutcome::Success);
+                    self.touch_progress();
+                }
+
+                // A fresh connection to a not-yet-identified validator will
+                // produce an identify response shortly; hold the early exit
+                // until it lands. This also covers connections Kademlia opened
+                // on its own.
+                if self.peer_details.contains_key(&peer_id)
+                    && !self.peer_info.contains_key(&peer_id)
+                {
+                    self.touch_progress();
                 }
 
                 // Any other dial to this peer that is still in flight can only
@@ -837,6 +932,7 @@ impl AuthorityDiscovery {
                     };
                     self.record_dial_outcome(dial.address, outcome);
                     self.advance_peer_dial(dial.peer);
+                    self.touch_progress();
                 }
 
                 log::trace!(
@@ -933,6 +1029,7 @@ impl AuthorityDiscovery {
     pub async fn discover(&mut self) {
         self.advance_dht_queries();
         self.start_time = std::time::Instant::now();
+        self.last_progress = std::time::Instant::now();
 
         // Should return immediately.
         self.interval_resubmit.tick().await;
@@ -955,6 +1052,30 @@ impl AuthorityDiscovery {
                 _ = progress_interval.tick().fuse() => {
                     if self.show_progress {
                         self.print_progress();
+                    }
+
+                    if self.discovery_finished() {
+                        if self.show_progress {
+                            // Clear the progress line.
+                            print!("\r{}\r", " ".repeat(100));
+                            let _ = std::io::stdout().flush();
+                        }
+
+                        if self.remaining_authorities.is_empty() {
+                            log::info!(
+                                "All authorities discovered and probed, exiting early after {}s",
+                                self.start_time.elapsed().as_secs()
+                            );
+                        } else {
+                            log::info!(
+                                "No progress for {}s with {} authorities still missing, exiting early after {}s",
+                                STALL_QUIET_SECS,
+                                self.remaining_authorities.len(),
+                                self.start_time.elapsed().as_secs()
+                            );
+                        }
+
+                        return;
                     }
                 }
 

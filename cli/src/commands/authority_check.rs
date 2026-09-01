@@ -23,7 +23,13 @@ use subp2p_explorer::util::ss58::to_ss58;
 use tokio::net::TcpStream;
 
 /// Maximum number of concurrent TCP connection checks.
-const MAX_PARALLEL_CHECKS: usize = 64;
+///
+/// Bounded so that the file descriptors stay well below common `ulimit -n`
+/// values even on large networks (e.g. Kusama with 1000+ validators). At 64
+/// the check dominated the wall time: unreachable addresses hold their slot
+/// for the full dial timeout, and batches complete at the pace of their
+/// slowest member.
+const MAX_PARALLEL_CHECKS: usize = 256;
 
 /// Writer that duplicates output to stdout and an optional log file.
 struct DualWriter {
