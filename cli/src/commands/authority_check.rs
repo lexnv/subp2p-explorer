@@ -12,7 +12,7 @@ use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -114,7 +114,24 @@ struct AuthorityResult {
     peer_id: Option<String>,
     agent_version: Option<String>,
     has_dht_record: bool,
+    /// Addresses the peer reported about itself over the identify protocol.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    identify_addresses: Vec<String>,
+    /// Transports found across all known addresses (DHT record + identify).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    transports: Vec<&'static str>,
     addresses: Vec<AddressCheck>,
+}
+
+/// Number of validators advertising each transport, across DHT record and
+/// identify addresses. A validator listening on several transports is counted
+/// once per transport.
+#[derive(Serialize, Default)]
+struct TransportStats {
+    tcp: usize,
+    websocket: usize,
+    webrtc: usize,
+    quic: usize,
 }
 
 /// Global statistics computed from all authority results.
@@ -144,6 +161,8 @@ struct GlobalStats {
     dial_skipped: usize,
     /// Number of public addresses with no dial outcome (never attempted).
     dial_pending: usize,
+    /// Per-transport validator counts (TCP, WebSocket, WebRTC, QUIC).
+    transports: TransportStats,
 }
 
 /// Top-level JSON report containing all authority results and global statistics.
@@ -163,6 +182,24 @@ fn shorten_address(addr: &Multiaddr) -> String {
     } else {
         s
     }
+}
+
+/// Classify the transport of a multiaddress.
+///
+/// WebSocket addresses also carry a `/tcp` component, so the more specific
+/// protocols are matched before falling back to plain TCP.
+fn classify_transport(addr: &Multiaddr) -> Option<&'static str> {
+    let mut tcp = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ws(_) | Protocol::Wss(_) => return Some("websocket"),
+            Protocol::WebRTC | Protocol::WebRTCDirect => return Some("webrtc"),
+            Protocol::Quic | Protocol::QuicV1 => return Some("quic"),
+            Protocol::Tcp(_) => tcp = true,
+            _ => (),
+        }
+    }
+    tcp.then_some("tcp")
 }
 
 /// Extract `host:port` from a multiaddress for TCP connection checking.
@@ -319,6 +356,17 @@ fn print_authority_result(
     if let Some(ref agent) = result.agent_version {
         writeln!(w, "  Agent:    {}", agent)?;
     }
+    if !result.transports.is_empty() {
+        writeln!(w, "  Transports: {}", result.transports.join(", "))?;
+    }
+
+    if !result.identify_addresses.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "  Identify addresses:")?;
+        for addr in &result.identify_addresses {
+            writeln!(w, "    {}", addr)?;
+        }
+    }
 
     if result.addresses.is_empty() {
         writeln!(w, "  No addresses in DHT record")?;
@@ -439,6 +487,7 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
         dial_failed: 0,
         dial_skipped: 0,
         dial_pending: 0,
+        transports: TransportStats::default(),
     };
 
     for r in results {
@@ -455,6 +504,16 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
             stats.identified += 1;
             let normalized = normalize_agent_version(v);
             *stats.agent_versions.entry(normalized).or_insert(0) += 1;
+        }
+
+        for transport in &r.transports {
+            match *transport {
+                "tcp" => stats.transports.tcp += 1,
+                "websocket" => stats.transports.websocket += 1,
+                "webrtc" => stats.transports.webrtc += 1,
+                "quic" => stats.transports.quic += 1,
+                _ => (),
+            }
         }
 
         let any_ok = r
@@ -654,6 +713,43 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
         "  └─ Pending:                      {:>6}",
         stats.dial_pending
     )?;
+    writeln!(w)?;
+
+    // A validator advertising several transports is counted once per
+    // transport, so the buckets do not add up to the number of validators.
+    writeln!(w, "  Transports (DHT + identify addresses)")?;
+    writeln!(
+        w,
+        "  ├─ TCP:                          {:>6} ({})",
+        stats.transports.tcp,
+        pct(stats.transports.tcp, stats.total_authorities)
+    )?;
+    writeln!(
+        w,
+        "  ├─ WebSocket:                    {:>6} ({})",
+        stats.transports.websocket,
+        pct(stats.transports.websocket, stats.total_authorities)
+    )?;
+    let (webrtc_branch, quic) = if stats.transports.quic > 0 {
+        ("├─", true)
+    } else {
+        ("└─", false)
+    };
+    writeln!(
+        w,
+        "  {} WebRTC:                       {:>6} ({})",
+        webrtc_branch,
+        stats.transports.webrtc,
+        pct(stats.transports.webrtc, stats.total_authorities)
+    )?;
+    if quic {
+        writeln!(
+            w,
+            "  └─ QUIC:                         {:>6} ({})",
+            stats.transports.quic,
+            pct(stats.transports.quic, stats.total_authorities)
+        )?;
+    }
 
     if !stats.agent_versions.is_empty() {
         writeln!(w)?;
@@ -933,15 +1029,32 @@ pub async fn check_authorities(
                 peer_id: None,
                 agent_version: None,
                 has_dht_record: false,
+                identify_addresses: Vec::new(),
+                transports: Vec::new(),
                 addresses: Vec::new(),
             });
             continue;
         };
 
         let peer_id = addrs.iter().find_map(get_peer_id);
-        let agent_version = peer_id
-            .and_then(|pid| peer_info.get(&pid))
-            .map(|info| info.agent_version.clone());
+        let info = peer_id.and_then(|pid| peer_info.get(&pid));
+        let agent_version = info.map(|info| info.agent_version.clone());
+
+        // Addresses the peer claims to listen on, taken from the identify
+        // response. These complement the DHT record: the record only holds
+        // what the authority chose to publish.
+        let identify_addresses: Vec<String> = info
+            .map(|info| info.listen_addrs.iter().map(|a| a.to_string()).collect())
+            .unwrap_or_default();
+
+        let mut transports: HashSet<&'static str> =
+            addrs.iter().filter_map(classify_transport).collect();
+        if let Some(info) = info {
+            transports.extend(info.listen_addrs.iter().filter_map(classify_transport));
+        }
+        let mut transports: Vec<&'static str> = transports.into_iter().collect();
+        transports.sort_unstable();
+
         let addresses = check_results.remove(&idx).unwrap_or_default();
 
         results.push(AuthorityResult {
@@ -951,6 +1064,8 @@ pub async fn check_authorities(
             peer_id: peer_id.map(|p| p.to_string()),
             agent_version,
             has_dht_record: true,
+            identify_addresses,
+            transports,
             addresses,
         });
     }
