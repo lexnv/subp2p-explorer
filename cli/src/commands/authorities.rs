@@ -1,4 +1,4 @@
-use crate::utils::{build_swarm, is_public_address};
+use crate::utils::{build_swarm, dial_error_message, is_dialable_transport, is_public_address};
 use codec::Decode;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -11,8 +11,7 @@ use libp2p::{
     core::ConnectedPoint,
     identify::Info,
     kad::{Event as KademliaEvent, GetRecordOk, QueryId, QueryResult, RecordKey as KademliaKey},
-    multiaddr::Protocol,
-    swarm::{dial_opts::DialOpts, ConnectionId, DialError, SwarmEvent},
+    swarm::{dial_opts::DialOpts, ConnectionId, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use rand::{seq::SliceRandom, thread_rng};
@@ -341,58 +340,6 @@ struct ActiveDial {
     /// and close the redundant one, so the resulting error says nothing about
     /// the address itself.
     superseded: bool,
-}
-
-/// Shortest useful description of an error.
-///
-/// libp2p nests the interesting part deep inside wrapper types, several of
-/// which have an empty `Display`, so walk the chain and keep the innermost
-/// cause that actually says something.
-fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut message = String::new();
-    let mut innermost = error;
-    let mut current = Some(error);
-
-    while let Some(err) = current {
-        let display = err.to_string();
-        if !display.is_empty() {
-            message = display;
-        }
-        innermost = err;
-        current = err.source();
-    }
-
-    if message.is_empty() {
-        format!("{innermost:?}")
-    } else {
-        message
-    }
-}
-
-/// Reason for a failed dial, as a single line.
-fn dial_error_message(error: &DialError) -> String {
-    match error {
-        DialError::Transport(attempts) => match attempts.first() {
-            Some((_, err)) => format!("transport: {}", root_cause(err)),
-            None => "transport: no attempt".to_string(),
-        },
-        DialError::WrongPeerId { obtained, .. } => format!("wrong peer ID: {obtained}"),
-        DialError::LocalPeerId { .. } => "dialed local peer ID".to_string(),
-        DialError::Denied { cause } => format!("denied: {}", root_cause(cause)),
-        DialError::DialPeerConditionFalse(condition) => {
-            format!("dial condition not met: {condition:?}")
-        }
-        DialError::Aborted => "aborted".to_string(),
-        DialError::NoAddresses => "no addresses".to_string(),
-    }
-}
-
-/// Whether the swarm can dial this address at all.
-///
-/// The swarm is built with TCP, DNS and WebSocket transports, all of which
-/// carry a `/tcp/` component.
-fn is_dialable_transport(addr: &Multiaddr) -> bool {
-    addr.iter().any(|proto| matches!(proto, Protocol::Tcp(_)))
 }
 
 impl AuthorityDiscovery {
