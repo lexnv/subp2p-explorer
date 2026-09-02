@@ -92,6 +92,9 @@ pub struct Notifications {
     peers_details: HashMap<PeerId, HashSet<ConnectionId>>,
     /// Data needed by protocols.
     data: ProtocolsData,
+    /// Whether to open the notification protocols on every new connection
+    /// and to accept the ones the remote opens.
+    auto_open: bool,
     /// Ensure we wake up on events. Set by the poll function.
     waker: Option<Waker>,
 }
@@ -103,8 +106,21 @@ impl Notifications {
             events: VecDeque::with_capacity(16),
             peers_details: HashMap::default(),
             data,
+            auto_open: true,
             waker: None,
         }
+    }
+
+    /// Whether to open the notification protocols on every new connection and
+    /// to accept the ones the remote opens (the default).
+    ///
+    /// An open notification substream keeps the connection alive for as long
+    /// as the remote keeps it, so a crawler that only needs the identify
+    /// response should turn this off: the connection is then closed by the
+    /// swarm once idle, instead of holding a slot on both sides until the
+    /// crawl ends.
+    pub fn set_auto_open(&mut self, auto_open: bool) {
+        self.auto_open = auto_open;
     }
 
     /// Propagate an event back to the swarm.
@@ -212,12 +228,14 @@ impl NetworkBehaviour for Notifications {
                     });
 
                 // Currently supports 2 protocols.
-                for index in 0..2 {
-                    self.propagate_event(ToSwarm::NotifyHandler {
-                        peer_id,
-                        handler: NotifyHandler::One(connection_id),
-                        event: NotificationsHandlerFromBehavior::Open { index },
-                    });
+                if self.auto_open {
+                    for index in 0..2 {
+                        self.propagate_event(ToSwarm::NotifyHandler {
+                            peer_id,
+                            handler: NotifyHandler::One(connection_id),
+                            event: NotificationsHandlerFromBehavior::Open { index },
+                        });
+                    }
                 }
             }
             libp2p::swarm::FromSwarm::ConnectionClosed(ConnectionClosed {
@@ -309,10 +327,15 @@ impl NetworkBehaviour for Notifications {
             }
             NotificationsHandlerToBehavior::OpenDesiredByRemote { index } => {
                 // Note: extend to reject protocols for specific peers in the future.
+                let event = if self.auto_open {
+                    NotificationsHandlerFromBehavior::Open { index }
+                } else {
+                    NotificationsHandlerFromBehavior::Close { index }
+                };
                 self.propagate_event(ToSwarm::NotifyHandler {
                     peer_id,
                     handler: NotifyHandler::One(connection_id),
-                    event: NotificationsHandlerFromBehavior::Open { index },
+                    event,
                 });
             }
             NotificationsHandlerToBehavior::CloseDesired { index } => {

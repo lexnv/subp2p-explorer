@@ -113,6 +113,8 @@ pub async fn build_swarm(
         .record_ttl(Some(Duration::from_secs(0)))
         .provider_ttl(Some(Duration::from_secs(0)))
         .query_timeout(query_timeout)
+        // The crawls are short-lived and drive their own queries.
+        .periodic_bootstrap_interval(None)
         .build(local_peer_id, genesis);
 
     let peer_info = PeerBehaviour::new(local_key.public());

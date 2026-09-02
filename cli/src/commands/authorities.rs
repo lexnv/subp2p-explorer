@@ -238,10 +238,14 @@ const MAX_QUERIES: usize = 128;
 const COMPLETE_QUIET_SECS: u64 = 5;
 
 /// Exit the discovery early when some records were never found but nothing
-/// made progress for this long. Two resubmission rounds
-/// ([`AuthorityDiscovery::interval_resubmit`]) fit in this window, so a record
-/// that can still be found gets its chance before the crawl gives up.
-const STALL_QUIET_SECS: u64 = 30;
+/// made progress for this long. A missing record is re-queried as soon as
+/// the previous lookup for it comes back empty (a few seconds each), so
+/// several attempts fit in this window before the crawl gives up.
+const STALL_QUIET_SECS: u64 = 20;
+
+/// Maximum number of concurrent targeted `get-closest-peers` lookups for
+/// validators that could not be reached at their advertised addresses.
+const MAX_LOOKUPS: usize = 32;
 
 /// Discover the authorities on the network.
 pub struct AuthorityDiscovery {
@@ -250,8 +254,9 @@ pub struct AuthorityDiscovery {
 
     /// In flight `get-record` kademlia queries to ensure that a maximum of `MAX_QUERIES` are in flight.
     queries: HashMap<QueryId, sr25519::PublicKey>,
-    /// In flight `get-closest-peers` kademlia queries to force the discovery of unidentified peers.
-    queries_discovery: HashSet<QueryId>,
+    /// In flight `get-closest-peers` lookups for validators that were not
+    /// reached at their advertised addresses, mapped to the validator peer.
+    queries_discovery: HashMap<QueryId, PeerId>,
 
     /// Map the in-flight kademlia queries to the authority ids.
     records_keys: HashMap<KademliaKey, sr25519::PublicKey>,
@@ -307,6 +312,12 @@ pub struct AuthorityDiscovery {
     /// Every distinct peer a connection was established with during the crawl,
     /// validators and regular network nodes alike.
     reached_peers: HashSet<PeerId>,
+
+    /// Validators whose advertised addresses were all probed without an
+    /// identify response, waiting for a lookup slot.
+    pending_lookups: VecDeque<PeerId>,
+    /// Validators a targeted lookup was already started for.
+    looked_up: HashSet<PeerId>,
 }
 
 /// The peer details extracted from the DHT.
@@ -363,17 +374,22 @@ struct ActiveDial {
 impl AuthorityDiscovery {
     /// Constructs a new [`AuthorityDiscovery`].
     pub fn new(
-        swarm: Swarm<Behaviour>,
+        mut swarm: Swarm<Behaviour>,
         authorities: Vec<sr25519::PublicKey>,
         timeout: std::time::Duration,
     ) -> Self {
+        // Only the identify response matters here. Notification substreams
+        // would keep every connection alive until the crawl ends, holding
+        // hundreds of slots on both sides for nothing.
+        swarm.behaviour_mut().notifications.set_auto_open(false);
+
         AuthorityDiscovery {
             swarm,
             queries: HashMap::with_capacity(1024),
 
             records_keys: HashMap::with_capacity(1024),
 
-            queries_discovery: HashSet::with_capacity(1024),
+            queries_discovery: HashMap::with_capacity(MAX_LOOKUPS),
             peer_info: HashMap::with_capacity(1024),
             peer_details: HashMap::with_capacity(1024),
             authority_to_details: HashMap::with_capacity(1024),
@@ -400,6 +416,9 @@ impl AuthorityDiscovery {
             active_dials: HashMap::with_capacity(1024),
 
             reached_peers: HashSet::with_capacity(4096),
+
+            pending_lookups: VecDeque::new(),
+            looked_up: HashSet::with_capacity(256),
         }
     }
 
@@ -415,26 +434,55 @@ impl AuthorityDiscovery {
         }
     }
 
-    /// Query the DHT for the closest peers of the authorities that
-    /// are not reacheable at the moment. This function is called
-    /// after the authorities are discovered from the DHT to avoid
-    /// running out of file descriptors.
-    ///
-    /// Note: they may never be reachable due to NAT.
-    fn query_peer_info(&mut self) {
-        // This is not correlated with the `MAX_QUERIES`.
-        const MAX_DISCOVERY_QUERIES: usize = 32;
+    /// Whether `peer` is a validator we have no identify response from yet.
+    fn is_unidentified_validator(&self, peer: &PeerId) -> bool {
+        self.peer_details.contains_key(peer) && !self.peer_info.contains_key(peer)
+    }
 
-        if self.queries_discovery.len() < MAX_DISCOVERY_QUERIES {
-            let query_num = MAX_DISCOVERY_QUERIES - self.queries_discovery.len();
-            for _ in 0..query_num {
-                self.queries_discovery.insert(
-                    self.swarm
-                        .behaviour_mut()
-                        .discovery
-                        .get_closest_peers(PeerId::random()),
-                );
-            }
+    /// Whether a probe of ours for `peer` is still running or queued.
+    fn has_pending_probes(&self, peer: &PeerId) -> bool {
+        self.active_dials.values().any(|dial| dial.peer == *peer)
+            || self
+                .queued_dials
+                .get(peer)
+                .is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// Start the queued lookups, at most [`MAX_LOOKUPS`] at a time.
+    fn advance_peer_lookups(&mut self) {
+        while self.queries_discovery.len() < MAX_LOOKUPS {
+            let Some(peer) = self.pending_lookups.pop_front() else {
+                break;
+            };
+            let id = self.swarm.behaviour_mut().discovery.get_closest_peers(peer);
+            self.queries_discovery.insert(id, peer);
+        }
+    }
+
+    /// Called once no probe is left for `peer`: every advertised address was
+    /// dialed or skipped and the validator still did not answer identify.
+    ///
+    /// The advertised addresses are not the only way to reach a validator.
+    /// Its DHT neighbours hold the addresses they observed it on, which may
+    /// differ from the record (stale record, node that moved, NAT). A lookup
+    /// for the validator's own peer ID walks to those neighbours and, since the
+    /// validator is the closest peer to its own key, Kademlia dials it with
+    /// the advertised addresses again plus every address learned on the way.
+    /// This doubles as the one retry of a probe that failed for a passing
+    /// reason. Random walks, the previous approach, only met a given validator
+    /// by luck and kept hundreds of connections busy in the meantime, which
+    /// slowed down the dials that matter.
+    fn on_probes_exhausted(&mut self, peer: PeerId) {
+        if self.swarm.is_connected(&peer)
+            || !self.is_unidentified_validator(&peer)
+            || self.has_pending_probes(&peer)
+        {
+            return;
+        }
+
+        if self.looked_up.insert(peer) {
+            self.pending_lookups.push_back(peer);
+            self.advance_peer_lookups();
         }
     }
 
@@ -477,14 +525,10 @@ impl AuthorityDiscovery {
             self.remaining_authorities.len()
         );
 
-        self.query_peer_info();
+        self.advance_peer_lookups();
     }
 
     /// Submit the DHT queries for the remaining authorities that did not receive a record yet.
-    ///
-    /// When the number of remaining authorities gets below a threashold (`MAX_QUERIES`),
-    /// this method will also submit the `get-closest-peers` queries to force the discovery
-    /// of the peers that are not reachable at the moment.
     fn resubmit_remaining_dht_queries(&mut self) {
         // Ignore older queries and finish them in Kademlia, otherwise they
         // keep running in the background and compete with the new ones.
@@ -500,18 +544,13 @@ impl AuthorityDiscovery {
         let mut remaining: Vec<_> = authorities.iter().collect();
         remaining.shuffle(&mut thread_rng());
 
-        let remaining_len = remaining.len();
-
         log::debug!(
             " Remaining authorities: {}",
             self.remaining_authorities.len()
         );
 
         self.query_dht_records(remaining.into_iter().take(MAX_QUERIES).cloned());
-
-        if remaining_len < MAX_QUERIES {
-            self.query_peer_info();
-        }
+        self.advance_peer_lookups();
     }
 
     /// Mark that the discovery made progress towards its goal (a new record,
@@ -534,6 +573,11 @@ impl AuthorityDiscovery {
     /// chance to find them.
     fn discovery_finished(&self) -> bool {
         if !self.active_dials.is_empty() {
+            return false;
+        }
+
+        // A lookup may still connect to a validator.
+        if !self.queries_discovery.is_empty() || !self.pending_lookups.is_empty() {
             return false;
         }
 
@@ -603,6 +647,8 @@ impl AuthorityDiscovery {
         }
 
         self.advance_peer_dial(peer_id);
+        // Nothing dialable in the record: only a lookup can reach this peer.
+        self.on_probes_exhausted(peer_id);
     }
 
     /// Probe all queued addresses of `peer_id` concurrently.
@@ -800,15 +846,19 @@ impl AuthorityDiscovery {
 
                     BehaviourEvent::Discovery(KademliaEvent::OutboundQueryProgressed {
                         id,
-                        result: QueryResult::GetClosestPeers(_),
+                        result: QueryResult::GetClosestPeers(result),
                         ..
                     }) => {
-                        if self.finished_query {
-                            log::debug!(" Discovered closes peers of {:?}", id);
-                        }
-
-                        self.queries_discovery.remove(&id);
-                        self.query_peer_info();
+                        let Some(peer) = self.queries_discovery.remove(&id) else {
+                            return;
+                        };
+                        log::debug!(
+                            "Lookup for validator {:?} finished: {:?}, identified: {}",
+                            peer,
+                            result.as_ref().map(|ok| ok.peers.len()),
+                            self.peer_info.contains_key(&peer),
+                        );
+                        self.advance_peer_lookups();
                     }
 
                     BehaviourEvent::PeerInfo(info_event) => {
@@ -862,6 +912,16 @@ impl AuthorityDiscovery {
                     endpoint,
                     num_established,
                 );
+
+                // The addresses still queued for this peer could not be probed
+                // while it was connected; probe them now rather than at the
+                // next periodic drain. For a validator that dropped the
+                // connection before answering identify this is also the next
+                // chance to reach it.
+                if num_established == 0 {
+                    self.advance_peer_dial(peer_id);
+                    self.on_probes_exhausted(peer_id);
+                }
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -940,6 +1000,7 @@ impl AuthorityDiscovery {
                     };
                     self.record_dial_outcome(dial.address, outcome);
                     self.advance_peer_dial(dial.peer);
+                    self.on_probes_exhausted(dial.peer);
                     self.touch_progress();
                 }
 
@@ -1002,6 +1063,7 @@ impl AuthorityDiscovery {
 
         let connected_peers = self.swarm.connected_peers().count();
         let queries_inflight = self.queries.len();
+        let lookups_inflight = self.queries_discovery.len() + self.pending_lookups.len();
         // Restricted to the advertised addresses: the outcome map also holds
         // the connections Kademlia opened to the rest of the network.
         let (dial_ok, dial_fail) = self
@@ -1016,7 +1078,7 @@ impl AuthorityDiscovery {
             });
 
         print!(
-            "\r       [{}] {}/{} ({:.1}%) | Id: {} | Dials: {}/{} ok | Err: {} | Peers: {} | Q: {} | {}s/{}s   ",
+            "\r       [{}] {}/{} ({:.1}%) | Id: {} | Dials: {}/{} ok | Err: {} | Peers: {} | Q: {} | L: {} | {}s/{}s   ",
             bar,
             found,
             total,
@@ -1027,6 +1089,7 @@ impl AuthorityDiscovery {
             self.dht_errors,
             connected_peers,
             queries_inflight,
+            lookups_inflight,
             elapsed,
             self.timeout_secs,
         );
