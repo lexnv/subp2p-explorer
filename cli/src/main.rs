@@ -8,7 +8,7 @@ mod utils;
 use clap::Parser as ClapParser;
 use commands::{
     authorities::{discover_authorities, resolve_bootnodes},
-    authority_check::check_authorities,
+    authority_check::{check_authorities, NetworkBackend},
     bootnodes::verify_bootnodes,
     dial_peer::dial_peer,
     discover_peer::discover_peer,
@@ -115,6 +115,12 @@ pub struct AuthorityCheckOpts {
     /// Write the full results as a JSON report to the given file path.
     #[clap(long)]
     json: Option<PathBuf>,
+    /// The p2p network stack used to crawl the DHT and dial the authorities.
+    ///
+    /// The report has the same shape for both, which makes the two stacks
+    /// directly comparable on the same network.
+    #[clap(long, value_enum, default_value_t)]
+    network_backend: NetworkBackend,
 }
 
 /// Dial one or more multiaddresses and fetch the identify message from each peer.
@@ -359,6 +365,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.identity_rpc,
                 opts.show_failing_only,
                 opts.json,
+                opts.network_backend,
             )
             .await
         }

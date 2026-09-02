@@ -48,3 +48,4 @@ reqwest = { workspace = true }
 chrono = { workspace = true }
 twox-hash = { workspace = true }
 blake2b_simd = { workspace = true }
+litep2p = { workspace = true }

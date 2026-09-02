@@ -58,6 +58,30 @@ Peer 12D3KooWAmQnrYxkv3jrH2uMdgw2KM1KHArxKjJmyFbNdgy3Gqm5: Location { city: "Zur
 Peer 12D3KooWQwMc5utYbnVbB2LDeUY64PHWi1bCwgWScRjJePcSfYqE: Location { city: "Montreal", accuracy_radius: Some(1000), latitude: Some(45.4995), longitude: Some(-73.5848), metro_code: None, time_zone: Some("America/Toronto") }
 ```
 
+## authority-check
+
+This command checks the health of the current authority set of a chain: it
+fetches the authorities from the runtime API, looks up their records in the
+DHT, dials every advertised address and reports per-authority and global
+statistics, optionally as a JSON report (`--json`).
+
+The DHT crawl and the dial probes can run on either of the two p2p stacks
+supported by substrate, selected with `--network-backend` (default `libp2p`).
+The report has the same shape for both, so the two stacks can be compared on
+the same network:
+
+```bash
+$ cargo run --release -- authority-check --url wss://westend-rpc.polkadot.io --timeout 900 --json westend.json
+$ cargo run --release -- authority-check --url wss://westend-rpc.polkadot.io --timeout 900 --json westend-litep2p.json --network-backend litep2p
+```
+
+[`auth-check-litep2p.sh`](./auth-check-litep2p.sh) wraps the litep2p run for
+the well-known chains, writing `<chain>-litep2p.json` and a console log:
+
+```bash
+$ TIMEOUT=900 ./auth-check-litep2p.sh westend kusama
+```
+
 ## verify-bootnodes
 
 This command verifies that the provided bootnodes are valid.

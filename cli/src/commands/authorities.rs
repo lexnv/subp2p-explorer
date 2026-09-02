@@ -231,21 +231,21 @@ pub(crate) async fn runtime_api_autorities(
 }
 
 /// The maximum number of Kademlia `get-records` queried a time.
-const MAX_QUERIES: usize = 128;
+pub(crate) const MAX_QUERIES: usize = 128;
 
 /// Exit the discovery early once every authority record was found, all dials
 /// resolved and the swarm has been quiet for this long.
-const COMPLETE_QUIET_SECS: u64 = 5;
+pub(crate) const COMPLETE_QUIET_SECS: u64 = 5;
 
 /// Exit the discovery early when some records were never found but nothing
 /// made progress for this long. A missing record is re-queried as soon as
 /// the previous lookup for it comes back empty (a few seconds each), so
 /// several attempts fit in this window before the crawl gives up.
-const STALL_QUIET_SECS: u64 = 20;
+pub(crate) const STALL_QUIET_SECS: u64 = 20;
 
 /// Maximum number of concurrent targeted `get-closest-peers` lookups for
 /// validators that could not be reached at their advertised addresses.
-const MAX_LOOKUPS: usize = 32;
+pub(crate) const MAX_LOOKUPS: usize = 32;
 
 /// Discover the authorities on the network.
 pub struct AuthorityDiscovery {

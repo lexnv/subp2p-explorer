@@ -6,6 +6,7 @@ use crate::commands::authorities::{
     detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
     runtime_api_autorities, AuthorityDiscovery, DialOutcome,
 };
+use crate::commands::authority_check_litep2p::Litep2pAuthorityDiscovery;
 use crate::commands::identity::{fetch_identity_names, IdentityResult};
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
@@ -18,6 +19,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use subp2p_explorer::util::crypto::sr25519;
 use subp2p_explorer::util::p2p::get_peer_id;
 use subp2p_explorer::util::ss58::to_ss58;
 use tokio::net::TcpStream;
@@ -30,6 +32,64 @@ use tokio::net::TcpStream;
 /// for the full dial timeout, and batches complete at the pace of their
 /// slowest member.
 const MAX_PARALLEL_CHECKS: usize = 256;
+
+/// Network stack used to crawl the DHT and probe the authorities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkBackend {
+    /// The rust-libp2p stack.
+    #[default]
+    Libp2p,
+    /// The litep2p stack.
+    Litep2p,
+}
+
+impl NetworkBackend {
+    /// Lower-case name, as used in file names and in the JSON report.
+    pub fn name(self) -> &'static str {
+        match self {
+            NetworkBackend::Libp2p => "libp2p",
+            NetworkBackend::Litep2p => "litep2p",
+        }
+    }
+
+    /// Capitalized name, for the report headings.
+    fn title(self) -> &'static str {
+        match self {
+            NetworkBackend::Libp2p => "Libp2p",
+            NetworkBackend::Litep2p => "Litep2p",
+        }
+    }
+}
+
+/// The parts of an identify response used by the report, in a form produced
+/// by both network backends.
+pub struct IdentifyInfo {
+    /// Name and version of the peer, e.g. `Parity Polkadot/v1.21.1-... (litep2p)`.
+    pub agent_version: String,
+    /// The addresses the peer claims to listen on.
+    pub listen_addrs: Vec<Multiaddr>,
+}
+
+impl From<Info> for IdentifyInfo {
+    fn from(info: Info) -> Self {
+        IdentifyInfo {
+            agent_version: info.agent_version,
+            listen_addrs: info.listen_addrs,
+        }
+    }
+}
+
+/// What a crawl hands back to the report, for both network backends: the
+/// addresses found in the DHT record of each authority, the identify response
+/// of every peer reached, the outcome of every dial, and every peer a
+/// connection was established with.
+pub type DiscoveryResults = (
+    HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
+    HashMap<PeerId, IdentifyInfo>,
+    HashMap<Multiaddr, DialOutcome>,
+    HashSet<PeerId>,
+);
 
 /// Writer that duplicates output to stdout and an optional log file.
 struct DualWriter {
@@ -102,7 +162,7 @@ struct AddressCheck {
     address_short: String,
     is_public: bool,
     result: AddressResult,
-    /// Outcome of the libp2p dial (noise + yamux).
+    /// Outcome of the p2p dial (noise + yamux).
     #[serde(skip_serializing_if = "Option::is_none")]
     dial_outcome: Option<DialOutcome>,
     /// Full multiaddress (not serialized, used for dial outcome lookup).
@@ -156,11 +216,13 @@ struct GlobalStats {
     reachable_authorities: usize,
     fully_reachable_authorities: usize,
     agent_versions: HashMap<String, usize>,
-    /// Authorities we established at least one libp2p connection with.
+    /// Authorities we established at least one p2p connection with, through
+    /// whichever network backend ran the crawl. The key is kept for
+    /// compatibility with older reports.
     libp2p_reachable_authorities: usize,
-    /// Number of public addresses where the libp2p dial succeeded.
+    /// Number of public addresses where the p2p dial succeeded.
     dial_success: usize,
-    /// Number of public addresses where the libp2p dial failed.
+    /// Number of public addresses where the p2p dial failed.
     dial_failed: usize,
     /// Number of public addresses that were not dialed, mostly because the peer
     /// was already connected through another address.
@@ -199,6 +261,8 @@ struct AllNodesStats {
 struct JsonReport<'a> {
     chain: Option<&'static str>,
     rpc_url: &'a str,
+    /// Network stack that ran the crawl.
+    network_backend: NetworkBackend,
     authorities: &'a [AuthorityResult],
     stats: &'a GlobalStats,
     /// Statistics over every node reached during the crawl (validators and
@@ -612,7 +676,7 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
 /// identify responses collected while walking the DHT.
 fn compute_all_nodes_stats(
     reached_peers: &HashSet<PeerId>,
-    peer_info: &HashMap<PeerId, Info>,
+    peer_info: &HashMap<PeerId, IdentifyInfo>,
     validator_peers: &HashSet<PeerId>,
 ) -> AllNodesStats {
     let mut stats = AllNodesStats {
@@ -662,6 +726,7 @@ fn print_global_summary(
     w: &mut DualWriter,
     stats: &GlobalStats,
     all_nodes: &AllNodesStats,
+    network_backend: NetworkBackend,
 ) -> io::Result<()> {
     let pct = |n: usize, d: usize| -> String {
         if d > 0 {
@@ -768,7 +833,11 @@ fn print_global_summary(
     // numbers below cover the addresses that were actually dialed, and the
     // authority level number covers everything we managed to talk to.
     let dial_probed = stats.dial_success + stats.dial_failed;
-    writeln!(w, "  Libp2p Dials (noise + yamux, public addresses)")?;
+    writeln!(
+        w,
+        "  {} Dials (noise + yamux, public addresses)",
+        network_backend.title()
+    )?;
     writeln!(
         w,
         "  ├─ Authorities connected:        {:>6} ({})",
@@ -979,6 +1048,9 @@ fn print_global_summary(
 /// Discovers authorities via the runtime API, scrapes their DHT records
 /// to collect advertised multiaddresses, then checks TCP connectivity
 /// to each address. Prints per-authority results and global statistics.
+///
+/// The DHT crawl and the dial probes run on the selected `network_backend`;
+/// everything else, including the report, is shared.
 pub async fn check_authorities(
     url: String,
     genesis: Option<String>,
@@ -990,15 +1062,21 @@ pub async fn check_authorities(
     identity_rpc: Option<String>,
     show_failing_only: bool,
     json_output: Option<PathBuf>,
+    network_backend: NetworkBackend,
 ) -> Result<(), Box<dyn Error>> {
     let rpc_url = Url::parse(&url)?;
 
-    // Create cache directory and log file.
+    // Create cache directory and log file. Runs on the default backend keep
+    // their historical file names.
     let cache_file = match fs::create_dir_all("cache") {
         Ok(()) => {
             let chain = detect_chain_name(&rpc_url).unwrap_or("unknown").to_string();
+            let backend_suffix = match network_backend {
+                NetworkBackend::Libp2p => "",
+                NetworkBackend::Litep2p => "-litep2p",
+            };
             let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
-            let path = format!("cache/{}-{}.logs", chain, timestamp);
+            let path = format!("cache/{}{}-{}.logs", chain, backend_suffix, timestamp);
             match File::create(&path) {
                 Ok(f) => {
                     eprintln!("       Logging output to {}", path);
@@ -1027,6 +1105,8 @@ pub async fn check_authorities(
         w,
         "════════════════════════════════════════════════════════════════════════"
     )?;
+    writeln!(w)?;
+    writeln!(w, "       Network backend: {}", network_backend.name())?;
     writeln!(w)?;
 
     // Resolve SS58 prefix: use provided format name or fetch from RPC.
@@ -1090,17 +1170,45 @@ pub async fn check_authorities(
 
     writeln!(
         w,
-        "[3/4] Discovering authority DHT records (timeout: {}s)...",
-        timeout.as_secs()
+        "[3/4] Discovering authority DHT records (timeout: {}s, backend: {})...",
+        timeout.as_secs(),
+        network_backend.name()
     )?;
-    let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
-    let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
-    discovery.set_show_progress(true);
-    discovery.discover().await;
-
-    // Extract the results and drop the swarm so its network connections and
+    // Extract the results and drop the network stack so its connections and
     // file descriptors are released before we open new TCP sockets in Phase 4.
-    let (authority_to_details, peer_info, dial_outcomes, reached_peers) = discovery.into_results();
+    let (authority_to_details, peer_info, dial_outcomes, reached_peers) = match network_backend {
+        NetworkBackend::Libp2p => {
+            let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
+            let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
+            discovery.set_show_progress(true);
+            discovery.discover().await;
+
+            let (authority_to_details, peer_info, dial_outcomes, reached_peers) =
+                discovery.into_results();
+            let peer_info: HashMap<PeerId, IdentifyInfo> = peer_info
+                .into_iter()
+                .map(|(peer, info)| (peer, IdentifyInfo::from(info)))
+                .collect();
+            (
+                authority_to_details,
+                peer_info,
+                dial_outcomes,
+                reached_peers,
+            )
+        }
+        NetworkBackend::Litep2p => {
+            let mut discovery = Litep2pAuthorityDiscovery::new(
+                &genesis,
+                bootnodes,
+                authorities.clone(),
+                timeout,
+                query_timeout,
+            )?;
+            discovery.set_show_progress(true);
+            discovery.discover().await;
+            discovery.into_results()
+        }
+    };
 
     let dht_count = authority_to_details.len();
     let identified_authorities = authorities
@@ -1158,8 +1266,10 @@ pub async fn check_authorities(
     writeln!(w)?;
     writeln!(
         w,
-        "       Libp2p dial results ({} of {} addresses probed):",
-        dial_probed, total_addrs
+        "       {} dial results ({} of {} addresses probed):",
+        network_backend.title(),
+        dial_probed,
+        total_addrs
     )?;
     writeln!(
         w,
@@ -1199,7 +1309,7 @@ pub async fn check_authorities(
 
     let mut check_results = run_connectivity_checks(pending_checks, dial_timeout, &mut w).await;
 
-    // Enrich each address check with the libp2p dial outcome.
+    // Enrich each address check with the p2p dial outcome.
     for checks in check_results.values_mut() {
         for check in checks.iter_mut() {
             if let Some(ref addr) = check.full_address {
@@ -1283,13 +1393,14 @@ pub async fn check_authorities(
         .filter_map(get_peer_id)
         .collect();
     let all_nodes = compute_all_nodes_stats(&reached_peers, &peer_info, &validator_peers);
-    print_global_summary(&mut w, &stats, &all_nodes)?;
+    print_global_summary(&mut w, &stats, &all_nodes, network_backend)?;
 
     // Write JSON report if requested.
     if let Some(ref path) = json_output {
         let report = JsonReport {
             chain: detect_chain_name(&rpc_url),
             rpc_url: rpc_url.as_str(),
+            network_backend,
             authorities: &results,
             stats: &stats,
             all_nodes: &all_nodes,

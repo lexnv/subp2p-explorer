@@ -2,7 +2,6 @@ use litep2p::types::multiaddr::{
     Error as LiteP2pError, Iter as LiteP2pIter, Multiaddr as LiteP2pMultiaddr,
     Protocol as LiteP2pProtocol,
 };
-use multiaddr::Multiaddr as LibP2pMultiaddr;
 use std::{
     fmt::{self, Debug, Display},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -14,8 +13,8 @@ pub use super::protocol::Protocol;
 // Re-export the macro under shorter name under `multiaddr`.
 pub use crate::build_multiaddr as multiaddr;
 
-/// [`Multiaddr`] type used in Substrate. Converted to libp2p's `Multiaddr`
-/// or litep2p's `Multiaddr` when passed to the corresponding network backend.
+/// [`Multiaddr`] type used in Substrate. Converted to the `multiaddr` crate
+/// type, shared by libp2p and litep2p, when passed to a network backend.
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub struct Multiaddr {
@@ -84,18 +83,6 @@ impl From<LiteP2pMultiaddr> for Multiaddr {
 impl From<Multiaddr> for LiteP2pMultiaddr {
     fn from(multiaddr: Multiaddr) -> Self {
         multiaddr.multiaddr
-    }
-}
-
-impl From<LibP2pMultiaddr> for Multiaddr {
-    fn from(multiaddr: LibP2pMultiaddr) -> Self {
-        multiaddr.into_iter().map(Into::into).collect()
-    }
-}
-
-impl From<Multiaddr> for LibP2pMultiaddr {
-    fn from(multiaddr: Multiaddr) -> Self {
-        multiaddr.into_iter().map(Into::into).collect()
     }
 }
 
