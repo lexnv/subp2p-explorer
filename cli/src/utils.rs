@@ -210,6 +210,24 @@ pub fn dial_error_message(error: &DialError) -> String {
     }
 }
 
+/// The address without its trailing `/p2p/<peer>` component.
+///
+/// litep2p reports the address of an established connection rebuilt from the
+/// socket, without the peer, while DHT records always carry it.
+pub fn without_peer_id(address: &Multiaddr) -> Multiaddr {
+    let mut address = address.clone();
+    if matches!(address.iter().last(), Some(Protocol::P2p(_))) {
+        address.pop();
+    }
+    address
+}
+
+/// The address with exactly one trailing `/p2p/<peer>` component, the form
+/// used by the DHT records.
+pub fn with_peer_id(address: &Multiaddr, peer: PeerId) -> Multiaddr {
+    without_peer_id(address).with(Protocol::P2p(peer))
+}
+
 /// Whether the swarm can dial this address at all.
 ///
 /// The swarms are built with TCP, DNS and WebSocket transports, all of which

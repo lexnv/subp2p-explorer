@@ -6,8 +6,9 @@ use crate::commands::authorities::{
     detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
     runtime_api_autorities, AuthorityDiscovery, DialOutcome,
 };
-use crate::commands::authority_check_litep2p::Litep2pAuthorityDiscovery;
+use crate::commands::authority_check_litep2p::{Litep2pAuthorityDiscovery, Litep2pOptions};
 use crate::commands::identity::{fetch_identity_names, IdentityResult};
+use crate::commands::peer_cache::PeerCache;
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
@@ -263,6 +264,8 @@ struct JsonReport<'a> {
     rpc_url: &'a str,
     /// Network stack that ran the crawl.
     network_backend: NetworkBackend,
+    /// Whether the litep2p crawl ran with the aggressive tuning.
+    aggressive: bool,
     authorities: &'a [AuthorityResult],
     stats: &'a GlobalStats,
     /// Statistics over every node reached during the crawl (validators and
@@ -1050,7 +1053,9 @@ fn print_global_summary(
 /// to each address. Prints per-authority results and global statistics.
 ///
 /// The DHT crawl and the dial probes run on the selected `network_backend`;
-/// everything else, including the report, is shared.
+/// everything else, including the report, is shared. `aggressive` selects the
+/// litep2p tuning that pushes the network as hard as it allows, warm-started
+/// from the peer cache written by the previous run of the same chain.
 pub async fn check_authorities(
     url: String,
     genesis: Option<String>,
@@ -1063,7 +1068,11 @@ pub async fn check_authorities(
     show_failing_only: bool,
     json_output: Option<PathBuf>,
     network_backend: NetworkBackend,
+    aggressive: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if aggressive && network_backend != NetworkBackend::Litep2p {
+        return Err("`--aggressive` is only supported with `--network-backend litep2p`".into());
+    }
     let rpc_url = Url::parse(&url)?;
 
     // Create cache directory and log file. Runs on the default backend keep
@@ -1106,7 +1115,12 @@ pub async fn check_authorities(
         "════════════════════════════════════════════════════════════════════════"
     )?;
     writeln!(w)?;
-    writeln!(w, "       Network backend: {}", network_backend.name())?;
+    writeln!(
+        w,
+        "       Network backend: {}{}",
+        network_backend.name(),
+        if aggressive { " (aggressive)" } else { "" }
+    )?;
     writeln!(w)?;
 
     // Resolve SS58 prefix: use provided format name or fetch from RPC.
@@ -1170,15 +1184,18 @@ pub async fn check_authorities(
 
     writeln!(
         w,
-        "[3/4] Discovering authority DHT records (timeout: {}s, backend: {})...",
+        "[3/4] Discovering authority DHT records (timeout: {}s, backend: {}{})...",
         timeout.as_secs(),
-        network_backend.name()
+        network_backend.name(),
+        if aggressive { ", aggressive" } else { "" }
     )?;
+    let cache_path = PeerCache::path(detect_chain_name(&rpc_url), &genesis);
+
     // Extract the results and drop the network stack so its connections and
     // file descriptors are released before we open new TCP sockets in Phase 4.
-    let (authority_to_details, peer_info, dial_outcomes, reached_peers) = match network_backend {
+    let results: DiscoveryResults = match network_backend {
         NetworkBackend::Libp2p => {
-            let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
+            let swarm = build_swarm(genesis.clone(), bootnodes, query_timeout).await?;
             let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
             discovery.set_show_progress(true);
             discovery.discover().await;
@@ -1197,18 +1214,72 @@ pub async fn check_authorities(
             )
         }
         NetworkBackend::Litep2p => {
+            // The aggressive crawl starts warm from the peers of the previous
+            // run of this chain, when there was one.
+            let peer_cache = if aggressive {
+                match PeerCache::load(&cache_path, &genesis) {
+                    Ok(Some(cache)) => {
+                        writeln!(
+                            w,
+                            "       Warm start: {} cached peers ({} validators) from {}",
+                            cache.peers.len(),
+                            cache.validator_count(),
+                            cache_path.display()
+                        )?;
+                        Some(cache)
+                    }
+                    Ok(None) => {
+                        writeln!(
+                            w,
+                            "       Cold start: no peer cache at {}",
+                            cache_path.display()
+                        )?;
+                        None
+                    }
+                    Err(e) => {
+                        writeln!(w, "       Warning: ignoring peer cache: {}", e)?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let mut discovery = Litep2pAuthorityDiscovery::new(
                 &genesis,
                 bootnodes,
                 authorities.clone(),
                 timeout,
                 query_timeout,
+                Litep2pOptions {
+                    aggressive,
+                    peer_cache,
+                },
             )?;
             discovery.set_show_progress(true);
             discovery.discover().await;
             discovery.into_results()
         }
     };
+
+    // Remember every peer reached, for the next warm start.
+    let cache = PeerCache::from_results(&genesis, &results);
+    match cache.save(&cache_path) {
+        Ok(()) => writeln!(
+            w,
+            "       Peer cache: {} peers ({} validators) saved to {}",
+            cache.peers.len(),
+            cache.validator_count(),
+            cache_path.display()
+        )?,
+        Err(e) => writeln!(
+            w,
+            "       Warning: could not write peer cache {}: {}",
+            cache_path.display(),
+            e
+        )?,
+    }
+    let (authority_to_details, peer_info, dial_outcomes, reached_peers) = results;
 
     let dht_count = authority_to_details.len();
     let identified_authorities = authorities
@@ -1401,6 +1472,7 @@ pub async fn check_authorities(
             chain: detect_chain_name(&rpc_url),
             rpc_url: rpc_url.as_str(),
             network_backend,
+            aggressive,
             authorities: &results,
             stats: &stats,
             all_nodes: &all_nodes,

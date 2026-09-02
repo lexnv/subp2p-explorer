@@ -121,6 +121,15 @@ pub struct AuthorityCheckOpts {
     /// directly comparable on the same network.
     #[clap(long, value_enum, default_value_t)]
     network_backend: NetworkBackend,
+    /// Push the network as hard as it allows (litep2p only).
+    ///
+    /// Queries every authority record at once, seeds the routing table and
+    /// pre-dials the validators from the peer cache of the previous run
+    /// (`cache/<chain>-peers.json`), probes all addresses of a validator in
+    /// parallel, keeps connections alive across DHT hops, and shortens the
+    /// dial and query timeouts (the query timeout is capped at 6 seconds).
+    #[clap(long)]
+    aggressive: bool,
 }
 
 /// Dial one or more multiaddresses and fetch the identify message from each peer.
@@ -366,6 +375,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.show_failing_only,
                 opts.json,
                 opts.network_backend,
+                opts.aggressive,
             )
             .await
         }
