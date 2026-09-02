@@ -10,7 +10,7 @@ use crate::commands::identity::{fetch_identity_names, IdentityResult};
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
-use libp2p::{multiaddr::Protocol, Multiaddr};
+use libp2p::{identify::Info, multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -171,6 +171,29 @@ struct GlobalStats {
     transports: TransportStats,
 }
 
+/// Statistics over every node reached while crawling the DHT, not just the
+/// validators. Kademlia connects to many regular network nodes on the way to
+/// the authority records, and each identify response reveals the transports
+/// that node runs.
+#[derive(Serialize)]
+struct AllNodesStats {
+    /// Distinct peers a connection was established with during the crawl.
+    reached_peers: usize,
+    /// Reached peers that answered the identify protocol.
+    identified: usize,
+    /// Identified peers that belong to the current authority set.
+    validators: usize,
+    /// Identified peers outside the authority set.
+    non_validators: usize,
+    /// Per-transport node counts from identify listen addresses. A node
+    /// listening on several transports is counted once per transport.
+    transports: TransportStats,
+    /// Identified peers whose listen addresses matched no known transport.
+    no_known_transport: usize,
+    /// Agent version distribution across all identified peers.
+    agent_versions: HashMap<String, usize>,
+}
+
 /// Top-level JSON report containing all authority results and global statistics.
 #[derive(Serialize)]
 struct JsonReport<'a> {
@@ -178,6 +201,9 @@ struct JsonReport<'a> {
     rpc_url: &'a str,
     authorities: &'a [AuthorityResult],
     stats: &'a GlobalStats,
+    /// Statistics over every node reached during the crawl (validators and
+    /// regular network nodes alike).
+    all_nodes: &'a AllNodesStats,
 }
 
 /// Remove the `/p2p/<peer_id>` suffix from a multiaddress for compact display.
@@ -582,8 +608,61 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
     stats
 }
 
+/// Compute statistics over every node reached during the crawl, from the
+/// identify responses collected while walking the DHT.
+fn compute_all_nodes_stats(
+    reached_peers: &HashSet<PeerId>,
+    peer_info: &HashMap<PeerId, Info>,
+    validator_peers: &HashSet<PeerId>,
+) -> AllNodesStats {
+    let mut stats = AllNodesStats {
+        reached_peers: reached_peers.len(),
+        identified: peer_info.len(),
+        validators: 0,
+        non_validators: 0,
+        transports: TransportStats::default(),
+        no_known_transport: 0,
+        agent_versions: HashMap::new(),
+    };
+
+    for (peer_id, info) in peer_info {
+        if validator_peers.contains(peer_id) {
+            stats.validators += 1;
+        } else {
+            stats.non_validators += 1;
+        }
+
+        let transports: HashSet<&'static str> = info
+            .listen_addrs
+            .iter()
+            .filter_map(classify_transport)
+            .collect();
+        if transports.is_empty() {
+            stats.no_known_transport += 1;
+        }
+        for transport in transports {
+            match transport {
+                "tcp" => stats.transports.tcp += 1,
+                "websocket" => stats.transports.websocket += 1,
+                "webrtc" => stats.transports.webrtc += 1,
+                "quic" => stats.transports.quic += 1,
+                _ => (),
+            }
+        }
+
+        let normalized = normalize_agent_version(&info.agent_version);
+        *stats.agent_versions.entry(normalized).or_insert(0) += 1;
+    }
+
+    stats
+}
+
 /// Print the global summary with formatted statistics.
-fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<()> {
+fn print_global_summary(
+    w: &mut DualWriter,
+    stats: &GlobalStats,
+    all_nodes: &AllNodesStats,
+) -> io::Result<()> {
     let pct = |n: usize, d: usize| -> String {
         if d > 0 {
             format!("{:.1}%", n as f64 / d as f64 * 100.0)
@@ -785,6 +864,112 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
         }
     }
 
+    // Everything the crawl talked to, not just the validators: Kademlia
+    // walks through many regular network nodes on the way to the records.
+    writeln!(w)?;
+    writeln!(w, "  Network Nodes (entire crawl, validators + others)")?;
+    writeln!(
+        w,
+        "  ├─ Peers connected:              {:>6}",
+        all_nodes.reached_peers
+    )?;
+    writeln!(
+        w,
+        "  ├─ Identified (identify):        {:>6} ({})",
+        all_nodes.identified,
+        pct(all_nodes.identified, all_nodes.reached_peers)
+    )?;
+    writeln!(
+        w,
+        "  ├─ Validators:                   {:>6}",
+        all_nodes.validators
+    )?;
+    writeln!(
+        w,
+        "  └─ Other nodes:                  {:>6}",
+        all_nodes.non_validators
+    )?;
+    writeln!(w)?;
+
+    // A node listening on several transports is counted once per transport,
+    // so the buckets do not add up to the number of identified nodes.
+    writeln!(w, "  Network Transports (identify addresses, all nodes)")?;
+    writeln!(
+        w,
+        "  ├─ TCP:                          {:>6} ({})",
+        all_nodes.transports.tcp,
+        pct(all_nodes.transports.tcp, all_nodes.identified)
+    )?;
+    writeln!(
+        w,
+        "  ├─ WebSocket:                    {:>6} ({})",
+        all_nodes.transports.websocket,
+        pct(all_nodes.transports.websocket, all_nodes.identified)
+    )?;
+    writeln!(
+        w,
+        "  ├─ WebRTC:                       {:>6} ({})",
+        all_nodes.transports.webrtc,
+        pct(all_nodes.transports.webrtc, all_nodes.identified)
+    )?;
+    if all_nodes.transports.quic > 0 {
+        writeln!(
+            w,
+            "  ├─ QUIC:                         {:>6} ({})",
+            all_nodes.transports.quic,
+            pct(all_nodes.transports.quic, all_nodes.identified)
+        )?;
+    }
+    writeln!(
+        w,
+        "  └─ No known transport:           {:>6} ({})",
+        all_nodes.no_known_transport,
+        pct(all_nodes.no_known_transport, all_nodes.identified)
+    )?;
+
+    if !all_nodes.agent_versions.is_empty() {
+        // The whole network runs far more releases than the validator set, so
+        // only the most common ones are printed; the JSON report keeps them all.
+        const MAX_NETWORK_VERSIONS: usize = 12;
+
+        writeln!(w)?;
+        writeln!(w, "  Network Agent Distribution (all identified nodes)")?;
+        let mut versions: Vec<_> = all_nodes.agent_versions.iter().collect();
+        versions.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+
+        let shown = versions.len().min(MAX_NETWORK_VERSIONS);
+        let rest: usize = versions[shown..].iter().map(|(_, count)| **count).sum();
+        for (i, (version, count)) in versions.iter().take(shown).enumerate() {
+            let branch = if i == shown - 1 && rest == 0 {
+                "└─"
+            } else {
+                "├─"
+            };
+            let v = if version.len() > 40 {
+                format!("{}...", &version[..37])
+            } else {
+                version.to_string()
+            };
+            writeln!(
+                w,
+                "  {} {:<42} {:>4} ({})",
+                branch,
+                v,
+                count,
+                pct(**count, all_nodes.identified)
+            )?;
+        }
+        if rest > 0 {
+            writeln!(
+                w,
+                "  └─ {:<42} {:>4} ({})",
+                format!("... {} more versions", versions.len() - shown),
+                rest,
+                pct(rest, all_nodes.identified)
+            )?;
+        }
+    }
+
     writeln!(w)?;
     Ok(())
 }
@@ -915,7 +1100,7 @@ pub async fn check_authorities(
 
     // Extract the results and drop the swarm so its network connections and
     // file descriptors are released before we open new TCP sockets in Phase 4.
-    let (authority_to_details, peer_info, dial_outcomes) = discovery.into_results();
+    let (authority_to_details, peer_info, dial_outcomes, reached_peers) = discovery.into_results();
 
     let dht_count = authority_to_details.len();
     let identified_authorities = authorities
@@ -934,6 +1119,12 @@ pub async fn check_authorities(
         authorities.len(),
         identified_authorities,
         authorities.len(),
+    )?;
+    writeln!(
+        w,
+        "       Network peers reached: {} | Identified: {}",
+        reached_peers.len(),
+        peer_info.len(),
     )?;
 
     // Report libp2p dial results. Addresses of a peer that is already connected
@@ -1086,7 +1277,13 @@ pub async fn check_authorities(
 
     // Print global summary.
     let stats = compute_global_stats(&results);
-    print_global_summary(&mut w, &stats)?;
+    let validator_peers: HashSet<PeerId> = authority_to_details
+        .values()
+        .flatten()
+        .filter_map(get_peer_id)
+        .collect();
+    let all_nodes = compute_all_nodes_stats(&reached_peers, &peer_info, &validator_peers);
+    print_global_summary(&mut w, &stats, &all_nodes)?;
 
     // Write JSON report if requested.
     if let Some(ref path) = json_output {
@@ -1095,6 +1292,7 @@ pub async fn check_authorities(
             rpc_url: rpc_url.as_str(),
             authorities: &results,
             stats: &stats,
+            all_nodes: &all_nodes,
         };
         let file = File::create(path)?;
         serde_json::to_writer_pretty(file, &report)?;

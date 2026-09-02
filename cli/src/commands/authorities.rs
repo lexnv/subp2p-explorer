@@ -303,6 +303,10 @@ pub struct AuthorityDiscovery {
     /// Kademlia during the crawl are not tracked here: they carry no
     /// information about a specific advertised address.
     active_dials: HashMap<ConnectionId, ActiveDial>,
+
+    /// Every distinct peer a connection was established with during the crawl,
+    /// validators and regular network nodes alike.
+    reached_peers: HashSet<PeerId>,
 }
 
 /// The peer details extracted from the DHT.
@@ -394,6 +398,8 @@ impl AuthorityDiscovery {
             dialed_addresses: HashSet::with_capacity(4096),
             queued_dials: HashMap::with_capacity(1024),
             active_dials: HashMap::with_capacity(1024),
+
+            reached_peers: HashSet::with_capacity(4096),
         }
     }
 
@@ -864,6 +870,8 @@ impl AuthorityDiscovery {
                 num_established,
                 ..
             } => {
+                self.reached_peers.insert(peer_id);
+
                 // The address that carried the connection is reachable, no
                 // matter who started the dial: Kademlia opens connections of
                 // its own during the crawl and they prove the same thing.
@@ -1128,6 +1136,7 @@ impl AuthorityDiscovery {
         HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
         HashMap<PeerId, Info>,
         HashMap<Multiaddr, DialOutcome>,
+        HashSet<PeerId>,
     ) {
         self.finalize_queued_dials();
 
@@ -1135,6 +1144,7 @@ impl AuthorityDiscovery {
             self.authority_to_details,
             self.peer_info,
             self.dial_outcomes,
+            self.reached_peers,
         )
     }
 }
