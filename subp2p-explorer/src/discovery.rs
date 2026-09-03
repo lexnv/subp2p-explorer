@@ -24,6 +24,8 @@ pub struct DiscoveryBuilder {
     provider_ttl: Option<Duration>,
     /// Sets the timeout for a single query.
     query_timeout: Duration,
+    /// Interval of the periodic bootstrap, `None` disables it.
+    periodic_bootstrap_interval: Option<Duration>,
 }
 
 impl Default for DiscoveryBuilder {
@@ -40,6 +42,7 @@ impl DiscoveryBuilder {
             record_ttl: None,
             provider_ttl: None,
             query_timeout: Duration::from_secs(15),
+            periodic_bootstrap_interval: Some(Duration::from_secs(5 * 60)),
         }
     }
 
@@ -71,6 +74,18 @@ impl DiscoveryBuilder {
         self
     }
 
+    /// Sets the interval of the periodic bootstrap, `None` disables it.
+    ///
+    /// A bootstrap refreshes every k-bucket with a lookup, which is background
+    /// traffic a short-lived crawler does not need. Kademlia still bootstraps
+    /// once new peers enter the routing table.
+    ///
+    /// Default: 5 minutes.
+    pub fn periodic_bootstrap_interval(mut self, interval: Option<Duration>) -> Self {
+        self.periodic_bootstrap_interval = interval;
+        self
+    }
+
     /// Build the discovery protocol.
     pub fn build(self, local_peer_id: PeerId, genesis_hash: &str) -> Discovery {
         let kademlia_protocol = StreamProtocol::try_from_owned(format!("/{genesis_hash}/kad"))
@@ -81,6 +96,7 @@ impl DiscoveryBuilder {
         config.set_record_ttl(self.record_ttl);
         config.set_provider_record_ttl(self.provider_ttl);
         config.set_query_timeout(self.query_timeout);
+        config.set_periodic_bootstrap_interval(self.periodic_bootstrap_interval);
 
         // Use memory store for kad.
         let store = MemoryStore::new(local_peer_id);

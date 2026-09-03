@@ -6,24 +6,91 @@ use crate::commands::authorities::{
     detect_chain_name, fetch_genesis_hash, fetch_ss58_prefix, resolve_bootnodes,
     runtime_api_autorities, AuthorityDiscovery, DialOutcome,
 };
+use crate::commands::authority_check_litep2p::{Litep2pAuthorityDiscovery, Litep2pOptions};
 use crate::commands::identity::{fetch_identity_names, IdentityResult};
+use crate::commands::peer_cache::PeerCache;
 use crate::utils::{build_swarm, is_public_address};
 use futures::StreamExt;
 use jsonrpsee::client_transport::ws::Url;
-use libp2p::{multiaddr::Protocol, Multiaddr};
+use libp2p::{identify::Info, multiaddr::Protocol, Multiaddr, PeerId};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use subp2p_explorer::util::crypto::sr25519;
 use subp2p_explorer::util::p2p::get_peer_id;
 use subp2p_explorer::util::ss58::to_ss58;
 use tokio::net::TcpStream;
 
 /// Maximum number of concurrent TCP connection checks.
-const MAX_PARALLEL_CHECKS: usize = 64;
+///
+/// Bounded so that the file descriptors stay well below common `ulimit -n`
+/// values even on large networks (e.g. Kusama with 1000+ validators). At 64
+/// the check dominated the wall time: unreachable addresses hold their slot
+/// for the full dial timeout, and batches complete at the pace of their
+/// slowest member.
+const MAX_PARALLEL_CHECKS: usize = 256;
+
+/// Network stack used to crawl the DHT and probe the authorities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkBackend {
+    /// The rust-libp2p stack.
+    #[default]
+    Libp2p,
+    /// The litep2p stack.
+    Litep2p,
+}
+
+impl NetworkBackend {
+    /// Lower-case name, as used in file names and in the JSON report.
+    pub fn name(self) -> &'static str {
+        match self {
+            NetworkBackend::Libp2p => "libp2p",
+            NetworkBackend::Litep2p => "litep2p",
+        }
+    }
+
+    /// Capitalized name, for the report headings.
+    fn title(self) -> &'static str {
+        match self {
+            NetworkBackend::Libp2p => "Libp2p",
+            NetworkBackend::Litep2p => "Litep2p",
+        }
+    }
+}
+
+/// The parts of an identify response used by the report, in a form produced
+/// by both network backends.
+pub struct IdentifyInfo {
+    /// Name and version of the peer, e.g. `Parity Polkadot/v1.21.1-... (litep2p)`.
+    pub agent_version: String,
+    /// The addresses the peer claims to listen on.
+    pub listen_addrs: Vec<Multiaddr>,
+}
+
+impl From<Info> for IdentifyInfo {
+    fn from(info: Info) -> Self {
+        IdentifyInfo {
+            agent_version: info.agent_version,
+            listen_addrs: info.listen_addrs,
+        }
+    }
+}
+
+/// What a crawl hands back to the report, for both network backends: the
+/// addresses found in the DHT record of each authority, the identify response
+/// of every peer reached, the outcome of every dial, and every peer a
+/// connection was established with.
+pub type DiscoveryResults = (
+    HashMap<sr25519::PublicKey, HashSet<Multiaddr>>,
+    HashMap<PeerId, IdentifyInfo>,
+    HashMap<Multiaddr, DialOutcome>,
+    HashSet<PeerId>,
+);
 
 /// Writer that duplicates output to stdout and an optional log file.
 struct DualWriter {
@@ -96,7 +163,7 @@ struct AddressCheck {
     address_short: String,
     is_public: bool,
     result: AddressResult,
-    /// Outcome of the full libp2p dial (noise + yamux + identify).
+    /// Outcome of the p2p dial (noise + yamux).
     #[serde(skip_serializing_if = "Option::is_none")]
     dial_outcome: Option<DialOutcome>,
     /// Full multiaddress (not serialized, used for dial outcome lookup).
@@ -114,7 +181,24 @@ struct AuthorityResult {
     peer_id: Option<String>,
     agent_version: Option<String>,
     has_dht_record: bool,
+    /// Addresses the peer reported about itself over the identify protocol.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    identify_addresses: Vec<String>,
+    /// Transports found across all known addresses (DHT record + identify).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    transports: Vec<&'static str>,
     addresses: Vec<AddressCheck>,
+}
+
+/// Number of validators advertising each transport, across DHT record and
+/// identify addresses. A validator listening on several transports is counted
+/// once per transport.
+#[derive(Serialize, Default)]
+struct TransportStats {
+    tcp: usize,
+    websocket: usize,
+    webrtc: usize,
+    quic: usize,
 }
 
 /// Global statistics computed from all authority results.
@@ -133,12 +217,44 @@ struct GlobalStats {
     reachable_authorities: usize,
     fully_reachable_authorities: usize,
     agent_versions: HashMap<String, usize>,
-    /// Number of addresses where libp2p dial succeeded.
+    /// Authorities we established at least one p2p connection with, through
+    /// whichever network backend ran the crawl. The key is kept for
+    /// compatibility with older reports.
+    libp2p_reachable_authorities: usize,
+    /// Number of public addresses where the p2p dial succeeded.
     dial_success: usize,
-    /// Number of addresses where libp2p dial failed.
+    /// Number of public addresses where the p2p dial failed.
     dial_failed: usize,
-    /// Number of addresses with no dial outcome (pending/not attempted).
+    /// Number of public addresses that were not dialed, mostly because the peer
+    /// was already connected through another address.
+    dial_skipped: usize,
+    /// Number of public addresses with no dial outcome (never attempted).
     dial_pending: usize,
+    /// Per-transport validator counts (TCP, WebSocket, WebRTC, QUIC).
+    transports: TransportStats,
+}
+
+/// Statistics over every node reached while crawling the DHT, not just the
+/// validators. Kademlia connects to many regular network nodes on the way to
+/// the authority records, and each identify response reveals the transports
+/// that node runs.
+#[derive(Serialize)]
+struct AllNodesStats {
+    /// Distinct peers a connection was established with during the crawl.
+    reached_peers: usize,
+    /// Reached peers that answered the identify protocol.
+    identified: usize,
+    /// Identified peers that belong to the current authority set.
+    validators: usize,
+    /// Identified peers outside the authority set.
+    non_validators: usize,
+    /// Per-transport node counts from identify listen addresses. A node
+    /// listening on several transports is counted once per transport.
+    transports: TransportStats,
+    /// Identified peers whose listen addresses matched no known transport.
+    no_known_transport: usize,
+    /// Agent version distribution across all identified peers.
+    agent_versions: HashMap<String, usize>,
 }
 
 /// Top-level JSON report containing all authority results and global statistics.
@@ -146,8 +262,15 @@ struct GlobalStats {
 struct JsonReport<'a> {
     chain: Option<&'static str>,
     rpc_url: &'a str,
+    /// Network stack that ran the crawl.
+    network_backend: NetworkBackend,
+    /// Whether the litep2p crawl ran with the aggressive tuning.
+    aggressive: bool,
     authorities: &'a [AuthorityResult],
     stats: &'a GlobalStats,
+    /// Statistics over every node reached during the crawl (validators and
+    /// regular network nodes alike).
+    all_nodes: &'a AllNodesStats,
 }
 
 /// Remove the `/p2p/<peer_id>` suffix from a multiaddress for compact display.
@@ -158,6 +281,24 @@ fn shorten_address(addr: &Multiaddr) -> String {
     } else {
         s
     }
+}
+
+/// Classify the transport of a multiaddress.
+///
+/// WebSocket addresses also carry a `/tcp` component, so the more specific
+/// protocols are matched before falling back to plain TCP.
+fn classify_transport(addr: &Multiaddr) -> Option<&'static str> {
+    let mut tcp = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ws(_) | Protocol::Wss(_) => return Some("websocket"),
+            Protocol::WebRTC | Protocol::WebRTCDirect => return Some("webrtc"),
+            Protocol::Quic | Protocol::QuicV1 => return Some("quic"),
+            Protocol::Tcp(_) => tcp = true,
+            _ => (),
+        }
+    }
+    tcp.then_some("tcp")
 }
 
 /// Extract `host:port` from a multiaddress for TCP connection checking.
@@ -246,11 +387,7 @@ async fn run_connectivity_checks(
             grouped.entry(idx).or_default().push(check);
         }
 
-        let _ = write!(
-            w,
-            "\r       Checked {}/{} addresses ...",
-            checked, total,
-        );
+        let _ = write!(w, "\r       Checked {}/{} addresses ...", checked, total,);
         let _ = w.flush();
     }
 
@@ -318,6 +455,17 @@ fn print_authority_result(
     if let Some(ref agent) = result.agent_version {
         writeln!(w, "  Agent:    {}", agent)?;
     }
+    if !result.transports.is_empty() {
+        writeln!(w, "  Transports: {}", result.transports.join(", "))?;
+    }
+
+    if !result.identify_addresses.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "  Identify addresses:")?;
+        for addr in &result.identify_addresses {
+            writeln!(w, "    {}", addr)?;
+        }
+    }
 
     if result.addresses.is_empty() {
         writeln!(w, "  No addresses in DHT record")?;
@@ -345,6 +493,7 @@ fn print_authority_result(
         let dial_status = match &check.dial_outcome {
             Some(DialOutcome::Success) => "\x1b[32mOK\x1b[0m".to_string(),
             Some(DialOutcome::Failed(e)) => format!("\x1b[31mFAIL\x1b[0m ({})", e),
+            Some(DialOutcome::Skipped(r)) => format!("\x1b[33mSKIP\x1b[0m ({})", r),
             None => "\x1b[33m-\x1b[0m".to_string(),
         };
 
@@ -431,10 +580,13 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
         unreachable_public: 0,
         reachable_authorities: 0,
         fully_reachable_authorities: 0,
+        libp2p_reachable_authorities: 0,
         agent_versions: HashMap::new(),
         dial_success: 0,
         dial_failed: 0,
+        dial_skipped: 0,
         dial_pending: 0,
+        transports: TransportStats::default(),
     };
 
     for r in results {
@@ -453,12 +605,33 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
             *stats.agent_versions.entry(normalized).or_insert(0) += 1;
         }
 
+        for transport in &r.transports {
+            match *transport {
+                "tcp" => stats.transports.tcp += 1,
+                "websocket" => stats.transports.websocket += 1,
+                "webrtc" => stats.transports.webrtc += 1,
+                "quic" => stats.transports.quic += 1,
+                _ => (),
+            }
+        }
+
         let any_ok = r
             .addresses
             .iter()
             .any(|a| matches!(a.result, AddressResult::Ok));
         if any_ok {
             stats.reachable_authorities += 1;
+        }
+
+        // An identified peer was necessarily connected, even when the
+        // connection was opened by Kademlia on an address we never probed
+        // ourselves.
+        let libp2p_ok = r.agent_version.is_some()
+            || r.addresses
+                .iter()
+                .any(|a| matches!(a.dial_outcome, Some(DialOutcome::Success)));
+        if libp2p_ok {
+            stats.libp2p_reachable_authorities += 1;
         }
 
         let pub_tested: Vec<_> = r
@@ -483,14 +656,18 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
                     AddressResult::Failed(_) => stats.unreachable_public += 1,
                     AddressResult::Skipped(_) => {}
                 }
+
+                // Private addresses are never dialed, so keeping them out of
+                // the dial buckets leaves both blocks with the same
+                // denominator.
+                match &a.dial_outcome {
+                    Some(DialOutcome::Success) => stats.dial_success += 1,
+                    Some(DialOutcome::Failed(_)) => stats.dial_failed += 1,
+                    Some(DialOutcome::Skipped(_)) => stats.dial_skipped += 1,
+                    None => stats.dial_pending += 1,
+                }
             } else {
                 stats.private_addresses += 1;
-            }
-
-            match &a.dial_outcome {
-                Some(DialOutcome::Success) => stats.dial_success += 1,
-                Some(DialOutcome::Failed(_)) => stats.dial_failed += 1,
-                None => stats.dial_pending += 1,
             }
         }
     }
@@ -498,8 +675,62 @@ fn compute_global_stats(results: &[AuthorityResult]) -> GlobalStats {
     stats
 }
 
+/// Compute statistics over every node reached during the crawl, from the
+/// identify responses collected while walking the DHT.
+fn compute_all_nodes_stats(
+    reached_peers: &HashSet<PeerId>,
+    peer_info: &HashMap<PeerId, IdentifyInfo>,
+    validator_peers: &HashSet<PeerId>,
+) -> AllNodesStats {
+    let mut stats = AllNodesStats {
+        reached_peers: reached_peers.len(),
+        identified: peer_info.len(),
+        validators: 0,
+        non_validators: 0,
+        transports: TransportStats::default(),
+        no_known_transport: 0,
+        agent_versions: HashMap::new(),
+    };
+
+    for (peer_id, info) in peer_info {
+        if validator_peers.contains(peer_id) {
+            stats.validators += 1;
+        } else {
+            stats.non_validators += 1;
+        }
+
+        let transports: HashSet<&'static str> = info
+            .listen_addrs
+            .iter()
+            .filter_map(classify_transport)
+            .collect();
+        if transports.is_empty() {
+            stats.no_known_transport += 1;
+        }
+        for transport in transports {
+            match transport {
+                "tcp" => stats.transports.tcp += 1,
+                "websocket" => stats.transports.websocket += 1,
+                "webrtc" => stats.transports.webrtc += 1,
+                "quic" => stats.transports.quic += 1,
+                _ => (),
+            }
+        }
+
+        let normalized = normalize_agent_version(&info.agent_version);
+        *stats.agent_versions.entry(normalized).or_insert(0) += 1;
+    }
+
+    stats
+}
+
 /// Print the global summary with formatted statistics.
-fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<()> {
+fn print_global_summary(
+    w: &mut DualWriter,
+    stats: &GlobalStats,
+    all_nodes: &AllNodesStats,
+    network_backend: NetworkBackend,
+) -> io::Result<()> {
     let pct = |n: usize, d: usize| -> String {
         if d > 0 {
             format!("{:.1}%", n as f64 / d as f64 * 100.0)
@@ -601,31 +832,91 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
     )?;
     writeln!(w)?;
 
-    let dial_total = stats.dial_success + stats.dial_failed + stats.dial_pending;
-    writeln!(w, "  Libp2p Dials (noise + yamux + identify)")?;
+    // Only one connection per peer is probed at a time, so the address level
+    // numbers below cover the addresses that were actually dialed, and the
+    // authority level number covers everything we managed to talk to.
+    let dial_probed = stats.dial_success + stats.dial_failed;
+    writeln!(
+        w,
+        "  {} Dials (noise + yamux, public addresses)",
+        network_backend.title()
+    )?;
+    writeln!(
+        w,
+        "  ├─ Authorities connected:        {:>6} ({})",
+        stats.libp2p_reachable_authorities,
+        pct(stats.libp2p_reachable_authorities, stats.total_authorities)
+    )?;
+    writeln!(w, "  ├─ Addresses probed:             {:>6}", dial_probed)?;
     writeln!(
         w,
         "  ├─ Connected:                    {:>6} ({})",
         stats.dial_success,
-        pct(stats.dial_success, dial_total)
+        pct(stats.dial_success, dial_probed)
     )?;
     writeln!(
         w,
         "  ├─ Failed:                       {:>6} ({})",
         stats.dial_failed,
-        pct(stats.dial_failed, dial_total)
+        pct(stats.dial_failed, dial_probed)
+    )?;
+    writeln!(
+        w,
+        "  ├─ Not probed:                   {:>6}",
+        stats.dial_skipped
     )?;
     writeln!(
         w,
         "  └─ Pending:                      {:>6}",
         stats.dial_pending
     )?;
+    writeln!(w)?;
+
+    // A validator advertising several transports is counted once per
+    // transport, so the buckets do not add up to the number of validators.
+    writeln!(w, "  Transports (DHT + identify addresses)")?;
+    writeln!(
+        w,
+        "  ├─ TCP:                          {:>6} ({})",
+        stats.transports.tcp,
+        pct(stats.transports.tcp, stats.total_authorities)
+    )?;
+    writeln!(
+        w,
+        "  ├─ WebSocket:                    {:>6} ({})",
+        stats.transports.websocket,
+        pct(stats.transports.websocket, stats.total_authorities)
+    )?;
+    let (webrtc_branch, quic) = if stats.transports.quic > 0 {
+        ("├─", true)
+    } else {
+        ("└─", false)
+    };
+    writeln!(
+        w,
+        "  {} WebRTC:                       {:>6} ({})",
+        webrtc_branch,
+        stats.transports.webrtc,
+        pct(stats.transports.webrtc, stats.total_authorities)
+    )?;
+    if quic {
+        writeln!(
+            w,
+            "  └─ QUIC:                         {:>6} ({})",
+            stats.transports.quic,
+            pct(stats.transports.quic, stats.total_authorities)
+        )?;
+    }
 
     if !stats.agent_versions.is_empty() {
         writeln!(w)?;
-        writeln!(w, "  Agent Distribution")?;
+        writeln!(w, "  Agent Distribution (identify handshake)")?;
         let mut versions: Vec<_> = stats.agent_versions.iter().collect();
         versions.sort_by(|a, b| b.1.cmp(a.1));
+        // Every version was read from an identify response, so the counts add
+        // up to the number of identified authorities.
+        let identified: usize = versions.iter().map(|(_, count)| **count).sum();
+        writeln!(w, "  ├─ Identify responses:           {:>6}", identified)?;
         let len = versions.len();
         for (i, (version, count)) in versions.iter().enumerate() {
             let branch = if i == len - 1 { "└─" } else { "├─" };
@@ -634,7 +925,120 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
             } else {
                 version.to_string()
             };
-            writeln!(w, "  {} {:<42} {:>4}", branch, v, count)?;
+            writeln!(
+                w,
+                "  {} {:<42} {:>4} ({})",
+                branch,
+                v,
+                count,
+                pct(**count, identified)
+            )?;
+        }
+    }
+
+    // Everything the crawl talked to, not just the validators: Kademlia
+    // walks through many regular network nodes on the way to the records.
+    writeln!(w)?;
+    writeln!(w, "  Network Nodes (entire crawl, validators + others)")?;
+    writeln!(
+        w,
+        "  ├─ Peers connected:              {:>6}",
+        all_nodes.reached_peers
+    )?;
+    writeln!(
+        w,
+        "  ├─ Identified (identify):        {:>6} ({})",
+        all_nodes.identified,
+        pct(all_nodes.identified, all_nodes.reached_peers)
+    )?;
+    writeln!(
+        w,
+        "  ├─ Validators:                   {:>6}",
+        all_nodes.validators
+    )?;
+    writeln!(
+        w,
+        "  └─ Other nodes:                  {:>6}",
+        all_nodes.non_validators
+    )?;
+    writeln!(w)?;
+
+    // A node listening on several transports is counted once per transport,
+    // so the buckets do not add up to the number of identified nodes.
+    writeln!(w, "  Network Transports (identify addresses, all nodes)")?;
+    writeln!(
+        w,
+        "  ├─ TCP:                          {:>6} ({})",
+        all_nodes.transports.tcp,
+        pct(all_nodes.transports.tcp, all_nodes.identified)
+    )?;
+    writeln!(
+        w,
+        "  ├─ WebSocket:                    {:>6} ({})",
+        all_nodes.transports.websocket,
+        pct(all_nodes.transports.websocket, all_nodes.identified)
+    )?;
+    writeln!(
+        w,
+        "  ├─ WebRTC:                       {:>6} ({})",
+        all_nodes.transports.webrtc,
+        pct(all_nodes.transports.webrtc, all_nodes.identified)
+    )?;
+    if all_nodes.transports.quic > 0 {
+        writeln!(
+            w,
+            "  ├─ QUIC:                         {:>6} ({})",
+            all_nodes.transports.quic,
+            pct(all_nodes.transports.quic, all_nodes.identified)
+        )?;
+    }
+    writeln!(
+        w,
+        "  └─ No known transport:           {:>6} ({})",
+        all_nodes.no_known_transport,
+        pct(all_nodes.no_known_transport, all_nodes.identified)
+    )?;
+
+    if !all_nodes.agent_versions.is_empty() {
+        // The whole network runs far more releases than the validator set, so
+        // only the most common ones are printed; the JSON report keeps them all.
+        const MAX_NETWORK_VERSIONS: usize = 12;
+
+        writeln!(w)?;
+        writeln!(w, "  Network Agent Distribution (all identified nodes)")?;
+        let mut versions: Vec<_> = all_nodes.agent_versions.iter().collect();
+        versions.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+
+        let shown = versions.len().min(MAX_NETWORK_VERSIONS);
+        let rest: usize = versions[shown..].iter().map(|(_, count)| **count).sum();
+        for (i, (version, count)) in versions.iter().take(shown).enumerate() {
+            let branch = if i == shown - 1 && rest == 0 {
+                "└─"
+            } else {
+                "├─"
+            };
+            let v = if version.len() > 40 {
+                format!("{}...", &version[..37])
+            } else {
+                version.to_string()
+            };
+            writeln!(
+                w,
+                "  {} {:<42} {:>4} ({})",
+                branch,
+                v,
+                count,
+                pct(**count, all_nodes.identified)
+            )?;
+        }
+        if rest > 0 {
+            writeln!(
+                w,
+                "  └─ {:<42} {:>4} ({})",
+                format!("... {} more versions", versions.len() - shown),
+                rest,
+                pct(rest, all_nodes.identified)
+            )?;
         }
     }
 
@@ -647,6 +1051,11 @@ fn print_global_summary(w: &mut DualWriter, stats: &GlobalStats) -> io::Result<(
 /// Discovers authorities via the runtime API, scrapes their DHT records
 /// to collect advertised multiaddresses, then checks TCP connectivity
 /// to each address. Prints per-authority results and global statistics.
+///
+/// The DHT crawl and the dial probes run on the selected `network_backend`;
+/// everything else, including the report, is shared. `aggressive` selects the
+/// litep2p tuning that pushes the network as hard as it allows, warm-started
+/// from the peer cache written by the previous run of the same chain.
 pub async fn check_authorities(
     url: String,
     genesis: Option<String>,
@@ -658,15 +1067,25 @@ pub async fn check_authorities(
     identity_rpc: Option<String>,
     show_failing_only: bool,
     json_output: Option<PathBuf>,
+    network_backend: NetworkBackend,
+    aggressive: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if aggressive && network_backend != NetworkBackend::Litep2p {
+        return Err("`--aggressive` is only supported with `--network-backend litep2p`".into());
+    }
     let rpc_url = Url::parse(&url)?;
 
-    // Create cache directory and log file.
+    // Create cache directory and log file. Runs on the default backend keep
+    // their historical file names.
     let cache_file = match fs::create_dir_all("cache") {
         Ok(()) => {
             let chain = detect_chain_name(&rpc_url).unwrap_or("unknown").to_string();
+            let backend_suffix = match network_backend {
+                NetworkBackend::Libp2p => "",
+                NetworkBackend::Litep2p => "-litep2p",
+            };
             let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S");
-            let path = format!("cache/{}-{}.logs", chain, timestamp);
+            let path = format!("cache/{}{}-{}.logs", chain, backend_suffix, timestamp);
             match File::create(&path) {
                 Ok(f) => {
                     eprintln!("       Logging output to {}", path);
@@ -694,6 +1113,13 @@ pub async fn check_authorities(
     writeln!(
         w,
         "════════════════════════════════════════════════════════════════════════"
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "       Network backend: {}{}",
+        network_backend.name(),
+        if aggressive { " (aggressive)" } else { "" }
     )?;
     writeln!(w)?;
 
@@ -758,17 +1184,102 @@ pub async fn check_authorities(
 
     writeln!(
         w,
-        "[3/4] Discovering authority DHT records (timeout: {}s)...",
-        timeout.as_secs()
+        "[3/4] Discovering authority DHT records (timeout: {}s, backend: {}{})...",
+        timeout.as_secs(),
+        network_backend.name(),
+        if aggressive { ", aggressive" } else { "" }
     )?;
-    let swarm = build_swarm(genesis, bootnodes, query_timeout).await?;
-    let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
-    discovery.set_show_progress(true);
-    discovery.discover().await;
+    let cache_path = PeerCache::path(detect_chain_name(&rpc_url), &genesis);
 
-    // Extract the results and drop the swarm so its network connections and
+    // Extract the results and drop the network stack so its connections and
     // file descriptors are released before we open new TCP sockets in Phase 4.
-    let (authority_to_details, peer_info, dial_outcomes) = discovery.into_results();
+    let results: DiscoveryResults = match network_backend {
+        NetworkBackend::Libp2p => {
+            let swarm = build_swarm(genesis.clone(), bootnodes, query_timeout).await?;
+            let mut discovery = AuthorityDiscovery::new(swarm, authorities.clone(), timeout);
+            discovery.set_show_progress(true);
+            discovery.discover().await;
+
+            let (authority_to_details, peer_info, dial_outcomes, reached_peers) =
+                discovery.into_results();
+            let peer_info: HashMap<PeerId, IdentifyInfo> = peer_info
+                .into_iter()
+                .map(|(peer, info)| (peer, IdentifyInfo::from(info)))
+                .collect();
+            (
+                authority_to_details,
+                peer_info,
+                dial_outcomes,
+                reached_peers,
+            )
+        }
+        NetworkBackend::Litep2p => {
+            // The aggressive crawl starts warm from the peers of the previous
+            // run of this chain, when there was one.
+            let peer_cache = if aggressive {
+                match PeerCache::load(&cache_path, &genesis) {
+                    Ok(Some(cache)) => {
+                        writeln!(
+                            w,
+                            "       Warm start: {} cached peers ({} validators) from {}",
+                            cache.peers.len(),
+                            cache.validator_count(),
+                            cache_path.display()
+                        )?;
+                        Some(cache)
+                    }
+                    Ok(None) => {
+                        writeln!(
+                            w,
+                            "       Cold start: no peer cache at {}",
+                            cache_path.display()
+                        )?;
+                        None
+                    }
+                    Err(e) => {
+                        writeln!(w, "       Warning: ignoring peer cache: {}", e)?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut discovery = Litep2pAuthorityDiscovery::new(
+                &genesis,
+                bootnodes,
+                authorities.clone(),
+                timeout,
+                query_timeout,
+                Litep2pOptions {
+                    aggressive,
+                    peer_cache,
+                },
+            )?;
+            discovery.set_show_progress(true);
+            discovery.discover().await;
+            discovery.into_results()
+        }
+    };
+
+    // Remember every peer reached, for the next warm start.
+    let cache = PeerCache::from_results(&genesis, &results);
+    match cache.save(&cache_path) {
+        Ok(()) => writeln!(
+            w,
+            "       Peer cache: {} peers ({} validators) saved to {}",
+            cache.peers.len(),
+            cache.validator_count(),
+            cache_path.display()
+        )?,
+        Err(e) => writeln!(
+            w,
+            "       Warning: could not write peer cache {}: {}",
+            cache_path.display(),
+            e
+        )?,
+    }
+    let (authority_to_details, peer_info, dial_outcomes, reached_peers) = results;
 
     let dht_count = authority_to_details.len();
     let identified_authorities = authorities
@@ -788,45 +1299,63 @@ pub async fn check_authorities(
         identified_authorities,
         authorities.len(),
     )?;
+    writeln!(
+        w,
+        "       Network peers reached: {} | Identified: {}",
+        reached_peers.len(),
+        peer_info.len(),
+    )?;
 
-    // Report libp2p dial results.
-    let dial_success = dial_outcomes
-        .values()
-        .filter(|o| matches!(o, DialOutcome::Success))
-        .count();
-    let dial_failed = dial_outcomes
-        .values()
-        .filter(|o| matches!(o, DialOutcome::Failed(_)))
-        .count();
-    let total_addrs: usize = authority_to_details.values().map(|a| a.len()).sum();
-    let dial_pending = total_addrs.saturating_sub(dial_outcomes.len());
+    // Report libp2p dial results. Addresses of a peer that is already connected
+    // are not dialed a second time, so they are reported as not probed instead
+    // of as failures.
+    //
+    // Only authority addresses are counted: the outcome map also holds the
+    // connections Kademlia opened to the rest of the network while crawling.
+    let mut dial_success = 0usize;
+    let mut dial_failed = 0usize;
+    let mut dial_skipped = 0usize;
+    let mut dial_pending = 0usize;
+    let mut total_addrs = 0usize;
+    for addr in authority_to_details.values().flatten() {
+        total_addrs += 1;
+        match dial_outcomes.get(addr) {
+            Some(DialOutcome::Success) => dial_success += 1,
+            Some(DialOutcome::Failed(_)) => dial_failed += 1,
+            Some(DialOutcome::Skipped(_)) => dial_skipped += 1,
+            None => dial_pending += 1,
+        }
+    }
+    let dial_probed = dial_success + dial_failed;
+    let probed_pct = |n: usize| -> f64 {
+        if dial_probed > 0 {
+            n as f64 / dial_probed as f64 * 100.0
+        } else {
+            0.0
+        }
+    };
     writeln!(w)?;
-    writeln!(w, "       Libp2p dial results ({} addresses):", total_addrs)?;
+    writeln!(
+        w,
+        "       {} dial results ({} of {} addresses probed):",
+        network_backend.title(),
+        dial_probed,
+        total_addrs
+    )?;
     writeln!(
         w,
         "       \u{251c}\u{2500} Connected:  {:>6} ({:.1}%)",
         dial_success,
-        if total_addrs > 0 {
-            dial_success as f64 / total_addrs as f64 * 100.0
-        } else {
-            0.0
-        }
+        probed_pct(dial_success)
     )?;
     writeln!(
         w,
         "       \u{251c}\u{2500} Failed:     {:>6} ({:.1}%)",
         dial_failed,
-        if total_addrs > 0 {
-            dial_failed as f64 / total_addrs as f64 * 100.0
-        } else {
-            0.0
-        }
+        probed_pct(dial_failed)
     )?;
-    writeln!(
-        w,
-        "       \u{2514}\u{2500} Pending:    {:>6}",
-        dial_pending
-    )?;
+    writeln!(w, "       \u{251c}\u{2500} Not probed: {:>6}", dial_skipped)?;
+    writeln!(w, "       \u{2514}\u{2500} Pending:    {:>6}", dial_pending)?;
     writeln!(w)?;
 
     // Phase 3: TCP connectivity checks on every discovered address.
@@ -851,7 +1380,7 @@ pub async fn check_authorities(
 
     let mut check_results = run_connectivity_checks(pending_checks, dial_timeout, &mut w).await;
 
-    // Enrich each address check with the libp2p dial outcome.
+    // Enrich each address check with the p2p dial outcome.
     for checks in check_results.values_mut() {
         for check in checks.iter_mut() {
             if let Some(ref addr) = check.full_address {
@@ -878,15 +1407,32 @@ pub async fn check_authorities(
                 peer_id: None,
                 agent_version: None,
                 has_dht_record: false,
+                identify_addresses: Vec::new(),
+                transports: Vec::new(),
                 addresses: Vec::new(),
             });
             continue;
         };
 
         let peer_id = addrs.iter().find_map(get_peer_id);
-        let agent_version = peer_id
-            .and_then(|pid| peer_info.get(&pid))
-            .map(|info| info.agent_version.clone());
+        let info = peer_id.and_then(|pid| peer_info.get(&pid));
+        let agent_version = info.map(|info| info.agent_version.clone());
+
+        // Addresses the peer claims to listen on, taken from the identify
+        // response. These complement the DHT record: the record only holds
+        // what the authority chose to publish.
+        let identify_addresses: Vec<String> = info
+            .map(|info| info.listen_addrs.iter().map(|a| a.to_string()).collect())
+            .unwrap_or_default();
+
+        let mut transports: HashSet<&'static str> =
+            addrs.iter().filter_map(classify_transport).collect();
+        if let Some(info) = info {
+            transports.extend(info.listen_addrs.iter().filter_map(classify_transport));
+        }
+        let mut transports: Vec<&'static str> = transports.into_iter().collect();
+        transports.sort_unstable();
+
         let addresses = check_results.remove(&idx).unwrap_or_default();
 
         results.push(AuthorityResult {
@@ -896,6 +1442,8 @@ pub async fn check_authorities(
             peer_id: peer_id.map(|p| p.to_string()),
             agent_version,
             has_dht_record: true,
+            identify_addresses,
+            transports,
             addresses,
         });
     }
@@ -910,15 +1458,24 @@ pub async fn check_authorities(
 
     // Print global summary.
     let stats = compute_global_stats(&results);
-    print_global_summary(&mut w, &stats)?;
+    let validator_peers: HashSet<PeerId> = authority_to_details
+        .values()
+        .flatten()
+        .filter_map(get_peer_id)
+        .collect();
+    let all_nodes = compute_all_nodes_stats(&reached_peers, &peer_info, &validator_peers);
+    print_global_summary(&mut w, &stats, &all_nodes, network_backend)?;
 
     // Write JSON report if requested.
     if let Some(ref path) = json_output {
         let report = JsonReport {
             chain: detect_chain_name(&rpc_url),
             rpc_url: rpc_url.as_str(),
+            network_backend,
+            aggressive,
             authorities: &results,
             stats: &stats,
+            all_nodes: &all_nodes,
         };
         let file = File::create(path)?;
         serde_json::to_writer_pretty(file, &report)?;

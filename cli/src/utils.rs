@@ -3,7 +3,7 @@
 // see LICENSE for license details.
 
 use ip_network::IpNetwork;
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId, Swarm};
+use libp2p::{identity, multiaddr::Protocol, swarm::DialError, Multiaddr, PeerId, Swarm};
 use maxminddb::{geoip2::City, Reader as GeoIpReader};
 use primitive_types::H256;
 use std::error::Error;
@@ -113,6 +113,8 @@ pub async fn build_swarm(
         .record_ttl(Some(Duration::from_secs(0)))
         .provider_ttl(Some(Duration::from_secs(0)))
         .query_timeout(query_timeout)
+        // The crawls are short-lived and drive their own queries.
+        .periodic_bootstrap_interval(None)
         .build(local_peer_id, genesis);
 
     let peer_info = PeerBehaviour::new(local_key.public());
@@ -162,4 +164,74 @@ pub fn is_public_address(addr: &Multiaddr) -> bool {
         _ => return false,
     };
     ip.is_global()
+}
+
+/// Shortest useful description of an error.
+///
+/// libp2p nests the interesting part deep inside wrapper types, several of
+/// which have an empty `Display`, so walk the chain and keep the innermost
+/// cause that actually says something.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = String::new();
+    let mut innermost = error;
+    let mut current = Some(error);
+
+    while let Some(err) = current {
+        let display = err.to_string();
+        if !display.is_empty() {
+            message = display;
+        }
+        innermost = err;
+        current = err.source();
+    }
+
+    if message.is_empty() {
+        format!("{innermost:?}")
+    } else {
+        message
+    }
+}
+
+/// Reason for a failed dial, as a single line.
+pub fn dial_error_message(error: &DialError) -> String {
+    match error {
+        DialError::Transport(attempts) => match attempts.first() {
+            Some((_, err)) => format!("transport: {}", root_cause(err)),
+            None => "transport: no attempt".to_string(),
+        },
+        DialError::WrongPeerId { obtained, .. } => format!("wrong peer ID: {obtained}"),
+        DialError::LocalPeerId { .. } => "dialed local peer ID".to_string(),
+        DialError::Denied { cause } => format!("denied: {}", root_cause(cause)),
+        DialError::DialPeerConditionFalse(condition) => {
+            format!("dial condition not met: {condition:?}")
+        }
+        DialError::Aborted => "aborted".to_string(),
+        DialError::NoAddresses => "no addresses".to_string(),
+    }
+}
+
+/// The address without its trailing `/p2p/<peer>` component.
+///
+/// litep2p reports the address of an established connection rebuilt from the
+/// socket, without the peer, while DHT records always carry it.
+pub fn without_peer_id(address: &Multiaddr) -> Multiaddr {
+    let mut address = address.clone();
+    if matches!(address.iter().last(), Some(Protocol::P2p(_))) {
+        address.pop();
+    }
+    address
+}
+
+/// The address with exactly one trailing `/p2p/<peer>` component, the form
+/// used by the DHT records.
+pub fn with_peer_id(address: &Multiaddr, peer: PeerId) -> Multiaddr {
+    without_peer_id(address).with(Protocol::P2p(peer))
+}
+
+/// Whether the swarm can dial this address at all.
+///
+/// The swarms are built with TCP, DNS and WebSocket transports, all of which
+/// carry a `/tcp/` component.
+pub fn is_dialable_transport(addr: &Multiaddr) -> bool {
+    addr.iter().any(|proto| matches!(proto, Protocol::Tcp(_)))
 }

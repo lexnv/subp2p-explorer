@@ -4,9 +4,11 @@
 
 pub mod authorities;
 pub mod authority_check;
+pub mod authority_check_litep2p;
 pub mod bootnodes;
 pub mod dial_peer;
 pub mod discover_peer;
 pub mod discovery;
 pub mod extrinsics;
 pub mod identity;
+pub mod peer_cache;

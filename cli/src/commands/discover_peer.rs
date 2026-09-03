@@ -3,7 +3,7 @@
 // see LICENSE for license details.
 
 use crate::commands::authorities::{fetch_genesis_hash, resolve_bootnodes};
-use crate::utils::build_swarm;
+use crate::utils::{build_swarm, is_dialable_transport, is_public_address};
 use codec::Decode;
 use futures::{FutureExt, StreamExt};
 use jsonrpsee::client_transport::ws::Url;
@@ -43,6 +43,10 @@ struct PeerDiscovery {
     /// Addresses for which a libp2p dial has been initiated, used to avoid
     /// dialing the same address repeatedly.
     dialed_addresses: HashSet<Multiaddr>,
+    /// Addresses that were never dialed because they cannot be reached from
+    /// here (private, or an unsupported transport), kept out of the dialed
+    /// counters.
+    skipped_addresses: HashSet<Multiaddr>,
     /// Set once we have received an identify response from the target.
     target_identified: bool,
     /// Number of distinct DHT events that surfaced an address for the target,
@@ -66,6 +70,7 @@ impl PeerDiscovery {
             peer_details: HashMap::with_capacity(1024),
             peer_role: HashMap::with_capacity(1024),
             dialed_addresses: HashSet::with_capacity(4096),
+            skipped_addresses: HashSet::with_capacity(4096),
             target_identified: false,
             target_dht_reports: 0,
             target_known_addresses: HashSet::new(),
@@ -122,10 +127,17 @@ impl PeerDiscovery {
 
     /// Force-dial a freshly-discovered address through the full libp2p
     /// stack to trigger noise + yamux + identify + notification handshakes.
+    /// Addresses that cannot be reached from here are skipped so they do not
+    /// skew the dialed counters.
     fn force_dial(&mut self, peer: PeerId, addr: Multiaddr) {
-        if !self.dialed_addresses.insert(addr.clone()) {
+        if self.dialed_addresses.contains(&addr) || self.skipped_addresses.contains(&addr) {
             return;
         }
+        if !is_public_address(&addr) || !is_dialable_transport(&addr) {
+            self.skipped_addresses.insert(addr);
+            return;
+        }
+        self.dialed_addresses.insert(addr.clone());
         self.swarm
             .behaviour_mut()
             .discovery
@@ -157,7 +169,7 @@ impl PeerDiscovery {
 
                 _ = log_interval.tick().fuse() => {
                     log::info!(
-                        "...Peer discovery target={} identified_target={} target_dht_reports={} target_known_addrs={} discovered={} identified={} dialed_addrs={} queries_in_flight={}",
+                        "...Peer discovery target={} identified_target={} target_dht_reports={} target_known_addrs={} discovered={} identified={} dialed_addrs={} skipped_addrs={} queries_in_flight={}",
                         self.target,
                         self.target_identified,
                         self.target_dht_reports,
@@ -165,6 +177,7 @@ impl PeerDiscovery {
                         self.discovered_with_addresses.len(),
                         self.peer_details.len(),
                         self.dialed_addresses.len(),
+                        self.skipped_addresses.len(),
                         self.queries.len(),
                     );
                 }
@@ -196,10 +209,7 @@ impl PeerDiscovery {
                         .flat_map(|p| p.addrs.iter().cloned())
                         .collect();
                     if !target_addrs.is_empty() {
-                        self.note_target_addresses(
-                            "closest-peers response",
-                            target_addrs,
-                        );
+                        self.note_target_addresses("closest-peers response", target_addrs);
                     }
 
                     // Replace immediately so concurrency stays at MAX_QUERIES.
@@ -320,7 +330,10 @@ pub async fn discover_peer(
     println!();
     println!("=== discover-peer summary ===");
     println!("target:                    {target}");
-    println!("identified target:         {}", peer_discovery.target_identified);
+    println!(
+        "identified target:         {}",
+        peer_discovery.target_identified
+    );
     println!(
         "DHT reports for target:    {} (other peers told us about the target)",
         peer_discovery.target_dht_reports
@@ -340,6 +353,10 @@ pub async fn discover_peer(
     println!(
         "addresses dialed:          {}",
         peer_discovery.dialed_addresses.len()
+    );
+    println!(
+        "addresses skipped:         {} (private or unsupported transport)",
+        peer_discovery.skipped_addresses.len()
     );
 
     if !peer_discovery.target_known_addresses.is_empty() {
